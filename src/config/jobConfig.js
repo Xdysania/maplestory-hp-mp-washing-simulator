@@ -129,21 +129,21 @@ export const AP_ALLOCATION_RULES = {
   thief: { prereqStat: 'dex', prereqTarget: 25 },
 };
 
-/** 通用 1 级默认四属性 */
-export const DEFAULT_BASE_STATS = { str: 4, dex: 4, int: 4, luk: 4 };
+/** 通用 1 级默认四属性（全职业：STR/DEX/LUK 5，INT 10） */
+export const DEFAULT_BASE_STATS = { str: 5, dex: 5, int: 10, luk: 5 };
 
 /**
- * 各职业初始四属性默认值
+ * 各职业初始四属性默认值（统一为战士同款）
  * @type {Record<JobId, BaseStats>}
  */
 export const DEFAULT_BASE_STATS_BY_JOB = {
   warriorHero: { str: 5, dex: 5, int: 10, luk: 5 },
   warriorPaladin: { str: 5, dex: 5, int: 10, luk: 5 },
-  magician: { str: 4, dex: 4, int: 12, luk: 4 },
-  buccaneer: { str: 4, dex: 4, int: 4, luk: 4 },
-  corsair: { str: 4, dex: 4, int: 4, luk: 4 },
-  archer: { str: 4, dex: 4, int: 4, luk: 4 },
-  thief: { str: 4, dex: 4, int: 4, luk: 4 },
+  magician: { str: 5, dex: 5, int: 10, luk: 5 },
+  buccaneer: { str: 5, dex: 5, int: 10, luk: 5 },
+  corsair: { str: 5, dex: 5, int: 10, luk: 5 },
+  archer: { str: 5, dex: 5, int: 10, luk: 5 },
+  thief: { str: 5, dex: 5, int: 10, luk: 5 },
 };
 
 /**
@@ -171,6 +171,23 @@ export function isWarriorClass(job) {
  */
 export function isMagicianClass(job) {
   return job === 'magician';
+}
+
+/**
+ * 船长 / 弓手 / 飞侠：先免费加 INT，达到扩蓝启动 INT 后边扩蓝边洗血（不必等 INT 满）
+ * @param {JobId} job
+ * @returns {boolean}
+ */
+export function isExpandThenWashJob(job) {
+  return job === 'corsair' || job === 'archer' || job === 'thief';
+}
+
+/**
+ * 物理职业扩蓝净收益转正的最低基础 INT（floor(INT/10)-2 ≥ 1 → INT≥30）
+ * @returns {number}
+ */
+export function getMinProfitableExpandInt() {
+  return 30;
 }
 
 /**
@@ -228,14 +245,15 @@ export const APR_HP_DEDUCTION = {
 /**
  * 升级洗血 (Fresh HP Wash) 基础 HP 区间 [min, max]（不含生命强化）
  * 战士：基础 20~24，生命强化满级 +30 → 合计 50~54
- * 对照表合计：战士 50~54 / 法师 6~10 / 弓飞 16~20 / 船长拳手 36~40
+ * 拳手：基础 16~20，生命强化满级 +20 → 合计 36~40
+ * 对照表合计：战士 50~54 / 法师 6~10 / 弓飞 16~20 / 船长 36~40 / 拳手 36~40
  * @type {Record<JobId, [number, number]>}
  */
 export const FRESH_HP_WASH_RANGE = {
   warriorHero: [20, 24],
   warriorPaladin: [20, 24],
   magician: [6, 10],
-  buccaneer: [36, 40],
+  buccaneer: [16, 20],
   corsair: [36, 40],
   archer: [16, 20],
   thief: [16, 20],

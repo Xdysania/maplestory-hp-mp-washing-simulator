@@ -9,6 +9,7 @@ import {
   MAX_MP,
   MW_OPTIONS,
   isDefaultAllIntStrategy,
+  isExpandThenWashJob,
 } from './config/jobConfig.js';
 import { optimizeTargetInt } from './utils/simulation.js';
 
@@ -180,6 +181,8 @@ export default function App() {
   const [planView, setPlanView] = useState('optimal');
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [runProgress, setRunProgress] = useState(0);
+  const [runProgressMessage, setRunProgressMessage] = useState('');
 
   /**
    * 切换职业并重置初始四属性
@@ -195,52 +198,71 @@ export default function App() {
   };
 
   /**
-   * 执行模拟
+   * 执行模拟（异步 + 进度反馈）
    */
-  const handleRun = () => {
+  const handleRun = async () => {
     setResult(null);
     setIsDetailsOpen(false);
     setPlanView('optimal');
     setIsRunning(true);
-    requestAnimationFrame(() => {
+    setRunProgress(0);
+    setRunProgressMessage('准备中…');
+
+    // 先让 React 画出进度条，再开始重计算
+    await new Promise((resolve) => {
+      requestAnimationFrame(() => resolve(undefined));
+    });
+
+    try {
       const rawTargetMp = String(targetMpAt200).trim();
       const parsedTargetMp =
         rawTargetMp === '' ? null : Number(rawTargetMp);
-      const simulationResult = optimizeTargetInt({
-        job,
-        baseStats: {
-          str: Number(baseStr),
-          dex: Number(baseDex),
-          int: Number(baseInt),
-          luk: Number(baseLuk),
-        },
-        equipIntBonuses: equipIntBonuses
-          .map((row) => ({
-            level: Number(row.level),
-            int: Number(row.int),
-          }))
-          .filter(
-            (row) =>
-              Number.isFinite(row.level) &&
-              row.level >= 1 &&
-              Number.isFinite(row.int) &&
-              row.int > 0,
+      const simulationResult = await optimizeTargetInt(
+        {
+          job,
+          baseStats: {
+            str: Number(baseStr),
+            dex: Number(baseDex),
+            int: Number(baseInt),
+            luk: Number(baseLuk),
+          },
+          equipIntBonuses: equipIntBonuses
+            .map((row) => ({
+              level: Number(row.level),
+              int: Number(row.int),
+            }))
+            .filter(
+              (row) =>
+                Number.isFinite(row.level) &&
+                row.level >= 1 &&
+                Number.isFinite(row.int) &&
+                row.int > 0,
+            ),
+          targetLevel: Number(targetLevel),
+          mwStartLevel: Number(mwStartLevel),
+          mwLevel: /** @type {import('./config/jobConfig.js').MwLevel} */ (
+            Number(mwLevel)
           ),
-        targetLevel: Number(targetLevel),
-        mwStartLevel: Number(mwStartLevel),
-        mwLevel: /** @type {import('./config/jobConfig.js').MwLevel} */ (Number(mwLevel)),
-        noActiveMpExpand,
-        hpEquipment: {
-          t10Ring: equipT10Ring,
-          butterflyRing: equipButterflyRing,
-          monNecklace: equipMonNecklace,
+          noActiveMpExpand,
+          hpEquipment: {
+            t10Ring: equipT10Ring,
+            butterflyRing: equipButterflyRing,
+            monNecklace: equipMonNecklace,
+          },
         },
-      }, parsedTargetMp !== null && Number.isFinite(parsedTargetMp)
-        ? parsedTargetMp
-        : null);
+        parsedTargetMp !== null && Number.isFinite(parsedTargetMp)
+          ? parsedTargetMp
+          : null,
+        ({ percent, message }) => {
+          setRunProgress(percent);
+          setRunProgressMessage(message);
+        },
+      );
       setResult(simulationResult);
+    } finally {
       setIsRunning(false);
-    });
+      setRunProgress(100);
+    }
   };
 
   return (
@@ -447,7 +469,7 @@ export default function App() {
                 label="200级目标 MP"
                 hint={
                   job === 'magician'
-                    ? '法师不计 NX：前期 AP 全加 INT；当“加 MP−退 30 MP”净收益转正后开始扩蓝，峰值达到 3 万后持续洗血'
+                    ? '法师不计 NX：前期 AP 全加 INT；净收益转正后扩蓝。近 3 万蓝时只洗到不亏损极限（给自然成长/扩蓝留空间），绝不一次洗到最低蓝'
                     : '可留空：不强制目标蓝，按默认推演结果；填写后系统寻找满足该 MP 且总 NX 最低的面板 INT'
                 }
               >
@@ -558,6 +580,22 @@ export default function App() {
           >
             {isRunning ? '模拟中…' : '开始模拟 (Run Simulation)'}
           </button>
+          {isRunning ? (
+            <div className="mt-2 space-y-1.5">
+              <div className="flex items-center justify-between gap-2 text-[11px] text-neutral-500">
+                <span className="truncate">{runProgressMessage || '计算中…'}</span>
+                <span className="shrink-0 tabular-nums">
+                  {Math.round(runProgress)}%
+                </span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-neutral-200">
+                <div
+                  className="h-full rounded-full bg-neutral-900 transition-[width] duration-150 ease-out"
+                  style={{ width: `${Math.max(2, runProgress)}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
         </aside>
 
         <div className="min-w-0 space-y-6">
@@ -574,8 +612,29 @@ export default function App() {
 
           {isRunning ? (
             <div className="flex min-h-[420px] flex-col items-center justify-center rounded-xl border border-neutral-200 bg-white p-12 text-center">
-              <div className="h-8 w-8 animate-spin rounded-full border-2 border-neutral-200 border-t-neutral-900" />
-              <p className="mt-4 text-sm text-neutral-500">模拟计算中…</p>
+              <div className="w-full max-w-md space-y-4">
+                <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-neutral-200 border-t-neutral-900" />
+                <div>
+                  <p className="text-sm font-medium text-neutral-800">
+                    {runProgressMessage || '模拟计算中…'}
+                  </p>
+                  <p className="mt-1 text-xs text-neutral-400">
+                    正在搜索最优 INT，界面会持续更新进度
+                  </p>
+                </div>
+                <div>
+                  <div className="mb-1.5 flex justify-between text-xs text-neutral-500">
+                    <span>进度</span>
+                    <span className="tabular-nums">{Math.round(runProgress)}%</span>
+                  </div>
+                  <div className="h-2.5 overflow-hidden rounded-full bg-neutral-100">
+                    <div
+                      className="h-full rounded-full bg-neutral-900 transition-[width] duration-150 ease-out"
+                      style={{ width: `${Math.max(2, runProgress)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
           ) : result && !result.validationErrors.length ? (
             <>
@@ -616,7 +675,7 @@ export default function App() {
                       <h2 className="text-base font-semibold text-neutral-950">洗血方案</h2>
                       <p className="mt-1 text-xs text-neutral-500">
                         {isMageDefaultAllInt
-                          ? '法师默认：AP 全加 INT；扩蓝净收益转正后开始扩蓝，峰值满 3 万后持续洗血'
+                          ? '法师默认：AP 全加 INT；近蓝上限时只洗到不亏损极限，扩蓝不触顶'
                           : planView === 'default'
                             ? `按职业默认 INT ${defaultInt} 推演`
                             : String(targetMpAt200).trim() === ''
@@ -659,7 +718,13 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-5">
+                  <div
+                    className={`grid gap-6 sm:grid-cols-2 ${
+                      isExpandThenWashJob(job)
+                        ? 'xl:grid-cols-6'
+                        : 'xl:grid-cols-5'
+                    }`}
+                  >
                     <SummaryMetric
                       label="最终 HP"
                       value={formatNumber(activePlan.finalHp)}
@@ -698,6 +763,17 @@ export default function App() {
                           : '满足目标时 NX 最低'
                       }
                     />
+                    {isExpandThenWashJob(job) ? (
+                      <SummaryMetric
+                        label="扩蓝启动 INT"
+                        value={
+                          result.optimalExpandStartInt ??
+                          result.optimalTargetInt
+                        }
+                        emphasized
+                        subtitle="平衡扩蓝收益与 NX，启动后边扩蓝边洗血"
+                      />
+                    ) : null}
                     <SummaryMetric
                       label="默认策略"
                       value={isMageDefaultAllInt ? '全加 INT' : defaultInt}

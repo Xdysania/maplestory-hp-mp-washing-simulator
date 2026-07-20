@@ -20,13 +20,13 @@ export const LIFE_ENHANCEMENT_LEVELUP_HP_PER_LEVEL = {
 
 /**
  * 生命强化：新鲜 AP 加 HP（洗血）时每级额外 HP
- * 战士/拳手满级均为 +30
+ * 战士满级 +30；拳手满级 +20
  * @type {Partial<Record<JobId, number>>}
  */
 export const LIFE_ENHANCEMENT_WASH_HP_PER_LEVEL = {
   warriorHero: 3,
   warriorPaladin: 3,
-  buccaneer: 3,
+  buccaneer: 2,
 };
 
 /** @deprecated 兼容旧引用；默认按洗血加成 */
@@ -111,7 +111,7 @@ export function hasMagicBoost(job) {
  * 计算生命强化提供的额外 HP
  * @param {JobId} job
  * @param {number} enhancementLevel
- * @param {'levelUp' | 'wash'} [context='wash'] 自然升级用 levelUp（战士满级+40），洗血用 wash（满级+30）
+ * @param {'levelUp' | 'wash'} [context='wash'] 自然升级用 levelUp（战士+40/拳手+30），洗血用 wash（战士+30/拳手+20）
  * @returns {number}
  */
 export function getLifeEnhancementHpBonus(
