@@ -1,5 +1,7 @@
 import {
   APR_NX_COST,
+  getDefaultTargetInt,
+  isDefaultAllIntStrategy,
   FRESH_AP_PER_LEVEL,
   INITIAL_STATS,
   APR_MP_DEDUCTION,
@@ -16,6 +18,7 @@ import {
   getMinMp,
   getLevelUpIntMpBonus,
   getMpWashGain,
+  getEquipIntAtLevel,
   getMwBonusPercent,
   randomInt,
   allocateLevelUpAp,
@@ -41,12 +44,20 @@ import {
  * @property {JobId} job
  * @property {BaseStats} baseStats
  * @property {number} targetInt
- * @property {number} equipInt
+ * @property {import('../config/jobConfig.js').EquipIntBonus[]} [equipIntBonuses] 按等级生效的装备智力列表
+ * @property {number} [equipInt] 兼容旧参数：固定装备智力（等价于 1 级起生效）
  * @property {number} targetLevel
  * @property {number} mwStartLevel
  * @property {import('../config/jobConfig.js').MwLevel} mwLevel
  * @property {number} [reserveMp]
  * @property {HpEquipmentFlags} [hpEquipment]
+ * @property {boolean} [noActiveMpExpand] 蓝不足时不主动扩蓝，等待自然增长
+ */
+
+/**
+ * @typedef {Object} OperationSegment
+ * @property {string} text 操作摘要文案
+ * @property {string[]} [details] 悬浮查看的逐次明细
  */
 
 /**
@@ -55,6 +66,7 @@ import {
  * @property {number} hpGain
  * @property {number} mpGain
  * @property {string} operation
+ * @property {OperationSegment[]} [operationSegments]
  * @property {boolean} warning
  * @property {string} [warningMessage]
  * @property {number} hp
@@ -91,7 +103,10 @@ import {
  * @property {boolean} hasWarning
  * @property {string[]} validationErrors
  * @property {number} [optimalTargetInt]
- * @property {number} [optimizationTargetMp]
+ * @property {number | null} [defaultTargetInt] 职业默认目标 INT；法师为 null（全加 INT）
+ * @property {boolean} [defaultAllInt] 默认方案是否为「AP 全加 INT」（法师）
+ * @property {SimulationResult} [defaultPlan] 按职业默认策略跑出的方案
+ * @property {number | null} [optimizationTargetMp]
  * @property {boolean} [optimizationFeasible]
  */
 
@@ -397,17 +412,20 @@ function runMagicianPreGrowthOverflowWash(
 }
 
 /**
- * 尝试执行一次扩蓝（消耗 APR：先加 MP 再扣退点惩罚，主属性 +1）
+ * 尝试执行一次完整扩蓝（加 MP → 退点回主属性）
+ * 物理职业净蓝 = floor(INT/10)-2；退点扣蓝只发生在流程内，不再从净蓝里重复扣除。
+ * 战士等职业的 APR_MP_DEDUCTION 用于洗血退蓝，以及扩蓝时「加蓝量 − 退点」还原净蓝。
  * @param {SimState} state
  * @param {JobId} job
  * @param {number} level
  * @param {number} reserveMp
- * @returns {{ success: boolean; mpGain?: number; mpDeduct?: number; reason?: string }}
+ * @returns {{ success: boolean; mpGain?: number; mpDeduct?: number; netMp?: number; reason?: string }}
  */
 function tryMpWash(state, job, level, reserveMp, mwLevel, mwStartLevel) {
   const mpGain = getMpWashGain(job, state.int, level, mwLevel, mwStartLevel);
   const mpDeduct = APR_MP_DEDUCTION[job];
-  const projectedMp = state.mp + mpGain - mpDeduct;
+  const netMp = mpGain - mpDeduct;
+  const projectedMp = state.mp + netMp;
   const { ok, minMp } = checkMpConstraint(projectedMp, level, job, reserveMp);
 
   if (!ok) {
@@ -423,7 +441,7 @@ function tryMpWash(state, job, level, reserveMp, mwLevel, mwStartLevel) {
     JOB_OPTIONS[job].mainStat.toLowerCase()
   );
   state[mainStat] += 1;
-  return { success: true, mpGain, mpDeduct };
+  return { success: true, mpGain, mpDeduct, netMp };
 }
 
 /**
@@ -480,7 +498,12 @@ function estimateNaturalHpToGoal(
 
     const [hpMin] = getHpGrowthRange(job, level);
     const naturalGain =
-      hpMin + getLifeEnhancementHpBonus(job, projectedSkills.lifeEnhancement);
+      hpMin +
+      getLifeEnhancementHpBonus(
+        job,
+        projectedSkills.lifeEnhancement,
+        'levelUp',
+      );
     projectedHp += capHpGain(projectedHp, naturalGain, washTargetHp);
 
     if (projectedHp >= washTargetHp) {
@@ -497,17 +520,18 @@ function estimateNaturalHpToGoal(
  * @param {number} currentMp
  * @param {number} currentLevel
  * @param {number} panelInt
- * @param {number} equipInt
+ * @param {import('../config/jobConfig.js').EquipIntBonus[]} equipIntBonuses
  * @param {JobId} job
  * @param {import('../config/jobConfig.js').MwLevel} mwLevel
  * @param {number} mwStartLevel
+ * @param {number} [magicBoostLevel=0]
  * @returns {number}
  */
 function projectMaxMpAt200(
   currentMp,
   currentLevel,
   panelInt,
-  equipInt,
+  equipIntBonuses,
   job,
   mwLevel,
   mwStartLevel,
@@ -518,6 +542,7 @@ function projectMaxMpAt200(
   const skillMp = getMagicBoostMpBonus(job, magicBoostLevel);
 
   for (let level = currentLevel + 1; level <= 200; level += 1) {
+    const equipInt = getEquipIntAtLevel(equipIntBonuses, level);
     projectedMp +=
       mpMax +
       getLevelUpIntMpBonus(panelInt, equipInt, level, mwLevel, mwStartLevel) +
@@ -525,6 +550,34 @@ function projectMaxMpAt200(
   }
 
   return projectedMp;
+}
+
+/**
+ * 规范化装备智力列表（兼容旧版固定 equipInt）
+ * @param {SimulationParams} params
+ * @returns {import('../config/jobConfig.js').EquipIntBonus[]}
+ */
+function resolveEquipIntBonuses(params) {
+  if (Array.isArray(params.equipIntBonuses)) {
+    return params.equipIntBonuses
+      .map((entry) => ({
+        level: Number(entry.level),
+        int: Number(entry.int),
+      }))
+      .filter(
+        (entry) =>
+          Number.isFinite(entry.level) &&
+          entry.level >= 1 &&
+          Number.isFinite(entry.int) &&
+          entry.int > 0,
+      )
+      .sort((a, b) => a.level - b.level);
+  }
+  const legacy = Number(params.equipInt);
+  if (Number.isFinite(legacy) && legacy > 0) {
+    return [{ level: 1, int: legacy }];
+  }
+  return [];
 }
 
 /**
@@ -546,7 +599,11 @@ function tryFreshHpWash(state, job, level, reserveMp, washTargetHp) {
 
   const [minHp, maxHp] = FRESH_HP_WASH_RANGE[job];
   const baseHp = randomInt(minHp, maxHp);
-  const skillBonus = getLifeEnhancementHpBonus(job, state.skills.lifeEnhancement);
+  const skillBonus = getLifeEnhancementHpBonus(
+    job,
+    state.skills.lifeEnhancement,
+    'wash',
+  );
   const rawHpGain = baseHp + skillBonus;
   const hpGain = capHpGain(state.hp, rawHpGain, washTargetHp);
 
@@ -586,6 +643,15 @@ function tryFreshHpWash(state, job, level, reserveMp, washTargetHp) {
 }
 
 /**
+ * 格式化完整扩蓝的净蓝结果
+ * @param {number} netMp
+ * @returns {string}
+ */
+function formatMpWashNet(netMp) {
+  return `净MP${netMp >= 0 ? '+' : ''}${netMp}`;
+}
+
+/**
  * 循环执行扩蓝
  * @param {SimState} state
  * @param {JobId} job
@@ -606,6 +672,7 @@ function runMpWashLoop(
   count = FRESH_AP_PER_LEVEL,
 ) {
   let washCount = 0;
+  let totalNetMp = 0;
   const washDetails = /** @type {string[]} */ ([]);
   let warning = false;
   let warningMessage = '';
@@ -618,7 +685,11 @@ function runMpWashLoop(
       break;
     }
     washCount += 1;
-    washDetails.push(`+${result.mpGain}/-${result.mpDeduct}`);
+    totalNetMp += result.netMp ?? 0;
+  }
+
+  if (washCount > 0) {
+    washDetails.push(formatMpWashNet(totalNetMp));
   }
 
   return { washCount, washDetails, warning, warningMessage };
@@ -699,7 +770,29 @@ function tryStaleHpWash(state, job, level, reserveMp, washTargetHp) {
 }
 
 /**
- * 洗血优先；MP 不足洗血时，本级剩余 AP 改用于扩蓝。
+ * 格式化一次升级洗血明细
+ * @param {number} index
+ * @param {{ hpGain?: number; baseHp?: number; skillBonus?: number; mpDeduct?: number }} hit
+ * @param {number} [enhancementLevel=0]
+ * @returns {string}
+ */
+function formatFreshHpWashDetail(index, hit, enhancementLevel = 0) {
+  const skillBonus = hit.skillBonus ?? 0;
+  const skillLabel =
+    skillBonus > 0
+      ? enhancementLevel > 0
+        ? `生命强化Lv${enhancementLevel}+${skillBonus}`
+        : `生命强化+${skillBonus}`
+      : '';
+  const hpPart =
+    skillBonus > 0
+      ? `+${hit.hpGain}HP（基础+${hit.baseHp} ${skillLabel}）`
+      : `+${hit.hpGain}HP`;
+  return `第${index}次：${hpPart}，MP-${hit.mpDeduct}`;
+}
+
+/**
+ * 洗血优先；MP 不足洗血时，本级剩余 AP 改用于扩蓝（可关闭）。
  * 未用完的新鲜 AP 会返回 unusedAp，由调用方加回主属性。
  * 船长/弓手/飞侠：新鲜 AP 优先扩蓝，再以重置洗血堆 HP（其新鲜洗血收益过低）。
  * @param {SimState} state
@@ -711,7 +804,8 @@ function tryStaleHpWash(state, job, level, reserveMp, washTargetHp) {
  * @param {string} hpLabel
  * @param {number} washTargetHp
  * @param {number} [apCount=5]
- * @returns {{ operation: string; warning: boolean; warningMessage: string; unusedAp: number }}
+ * @param {boolean} [noActiveMpExpand=false]
+ * @returns {{ operation: string; segments: OperationSegment[]; warning: boolean; warningMessage: string; unusedAp: number }}
  */
 function runFreshHpWashWithMpFallback(
   state,
@@ -723,15 +817,17 @@ function runFreshHpWashWithMpFallback(
   hpLabel,
   washTargetHp,
   apCount = FRESH_AP_PER_LEVEL,
+  noActiveMpExpand = false,
 ) {
   let warning = false;
   let warningMessage = '';
-  const parts = /** @type {string[]} */ ([]);
+  /** @type {OperationSegment[]} */
+  const segments = [];
   let usedAp = 0;
 
   // 法师：交给最大化 HP 循环（升级洗血 + APR扩蓝 + 重置洗血）
   if (isMagicianClass(job)) {
-    return runMagicianMaxHpCycle(
+    const mageResult = runMagicianMaxHpCycle(
       state,
       job,
       level,
@@ -740,71 +836,107 @@ function runFreshHpWashWithMpFallback(
       apCount,
       0,
     );
+    return {
+      ...mageResult,
+      segments: mageResult.operation
+        ? mageResult.operation.split(' → ').map((text) => ({ text }))
+        : [],
+    };
   }
 
   // 远程职业：新鲜 AP → 扩蓝，再重置洗血
   if (allowsStaleHpWash(job)) {
     let mpWashCount = 0;
-    const mpDetails = /** @type {string[]} */ ([]);
+    let totalNetMp = 0;
+    /** @type {string[]} */
+    const mpDetails = [];
     let staleWashCount = 0;
     let totalStaleHp = 0;
+    /** @type {string[]} */
+    const staleDetails = [];
 
-    for (let i = 0; i < apCount; i += 1) {
-      if (state.hp >= washTargetHp) {
-        break;
+    if (!noActiveMpExpand) {
+      for (let i = 0; i < apCount; i += 1) {
+        if (state.hp >= washTargetHp) {
+          break;
+        }
+        const mpResult = tryMpWash(state, job, level, reserveMp, mwLevel, mwStartLevel);
+        if (!mpResult.success) {
+          warning = true;
+          warningMessage = mpResult.reason ?? '扩蓝中断';
+          break;
+        }
+        mpWashCount += 1;
+        totalNetMp += mpResult.netMp ?? 0;
+        mpDetails.push(
+          `第${mpWashCount}次：${formatMpWashNet(mpResult.netMp ?? 0)}（加蓝+${mpResult.mpGain}，退点-${mpResult.mpDeduct}）`,
+        );
+        usedAp += 1;
       }
-      const mpResult = tryMpWash(state, job, level, reserveMp, mwLevel, mwStartLevel);
-      if (!mpResult.success) {
-        warning = true;
-        warningMessage = mpResult.reason ?? '扩蓝中断';
-        break;
-      }
-      mpWashCount += 1;
-      usedAp += 1;
-      mpDetails.push(`+${mpResult.mpGain}/-${mpResult.mpDeduct}`);
     }
 
     while (state.hp < washTargetHp) {
       const staleResult = tryStaleHpWash(state, job, level, reserveMp, washTargetHp);
       if (!staleResult.success) {
-        if (staleWashCount === 0 && mpWashCount === 0) {
-          warning = true;
-          warningMessage = staleResult.reason ?? '重置洗血中断';
-        }
         break;
       }
       staleWashCount += 1;
       totalStaleHp += staleResult.hpGain ?? 0;
+      staleDetails.push(
+        `第${staleWashCount}次：+${staleResult.hpGain}HP，MP-${APR_MP_DEDUCTION[job]}`,
+      );
     }
 
     if (mpWashCount > 0) {
-      parts.push(`智能扩蓝×${mpWashCount} [${mpDetails.join(', ')}]`);
+      segments.push({
+        text: `智能扩蓝×${mpWashCount} [${formatMpWashNet(totalNetMp)}]`,
+        details: mpDetails,
+      });
     }
     if (staleWashCount > 0) {
-      parts.push(`重置洗血×${staleWashCount} [合计+${totalStaleHp}HP]`);
+      segments.push({
+        text: `重置洗血×${staleWashCount} [合计+${totalStaleHp}HP]`,
+        details: staleDetails,
+      });
     }
-    if (parts.length === 0) {
-      parts.push('扩蓝/重置洗血均失败');
-      if (!warning) {
-        warning = true;
-        warningMessage = 'MP 不足以扩蓝或重置洗血';
+    if (segments.length === 0) {
+      if (noActiveMpExpand) {
+        segments.push({ text: '蓝不足，等待自然增长（不主动扩蓝）' });
+      } else {
+        segments.push({ text: '扩蓝/重置洗血均失败' });
+        if (!warning) {
+          warning = true;
+          warningMessage = 'MP 不足以扩蓝或重置洗血';
+        }
       }
+    } else if (
+      noActiveMpExpand &&
+      mpWashCount === 0 &&
+      state.hp < washTargetHp
+    ) {
+      segments.push({ text: '蓝不足，等待自然增长（不主动扩蓝）' });
     }
 
     return {
-      operation: parts.join(' → '),
+      operation: segments.map((segment) => segment.text).join(' → '),
+      segments,
       warning,
       warningMessage,
       unusedAp: Math.max(0, apCount - usedAp),
     };
   }
 
-  // 战士/拳手：新鲜 AP 优先升级洗血，蓝不足再扩蓝
+  // 战士/拳手：新鲜 AP 优先升级洗血，蓝不足再扩蓝（可关闭）
   let hpWashCount = 0;
   let totalHpFromWash = 0;
+  /** @type {string[]} */
+  const hpDetails = [];
   let mpFallback = false;
-  const mpDetails = /** @type {string[]} */ ([]);
   let mpWashCount = 0;
+  let totalNetMp = 0;
+  /** @type {string[]} */
+  const mpDetails = [];
+  let skippedExpandForNatural = false;
 
   for (let i = 0; i < apCount; i += 1) {
     if (state.hp >= washTargetHp) {
@@ -816,6 +948,13 @@ function runFreshHpWashWithMpFallback(
       if (hpResult.success) {
         hpWashCount += 1;
         totalHpFromWash += hpResult.hpGain ?? 0;
+        hpDetails.push(
+          formatFreshHpWashDetail(
+            hpWashCount,
+            hpResult,
+            state.skills.lifeEnhancement,
+          ),
+        );
         usedAp += 1;
         continue;
       }
@@ -823,6 +962,10 @@ function runFreshHpWashWithMpFallback(
         break;
       }
       mpFallback = true;
+      if (noActiveMpExpand) {
+        skippedExpandForNatural = true;
+        break;
+      }
     }
 
     const mpResult = tryMpWash(state, job, level, reserveMp, mwLevel, mwStartLevel);
@@ -832,36 +975,47 @@ function runFreshHpWashWithMpFallback(
       break;
     }
     mpWashCount += 1;
+    totalNetMp += mpResult.netMp ?? 0;
+    mpDetails.push(
+      `第${mpWashCount}次：${formatMpWashNet(mpResult.netMp ?? 0)}（加蓝+${mpResult.mpGain}，退点-${mpResult.mpDeduct}）`,
+    );
     usedAp += 1;
-    mpDetails.push(`+${mpResult.mpGain}/-${mpResult.mpDeduct}`);
   }
 
   if (hpWashCount > 0) {
-    parts.push(`${hpLabel}×${hpWashCount} [合计+${totalHpFromWash}HP]`);
+    segments.push({
+      text: `${hpLabel}×${hpWashCount} [合计+${totalHpFromWash}HP]`,
+      details: hpDetails,
+    });
   }
 
-  if (mpFallback) {
+  if (skippedExpandForNatural) {
+    segments.push({ text: '蓝不足，等待自然增长（不主动扩蓝）' });
+  } else if (mpFallback) {
     if (mpWashCount > 0) {
-      parts.push(
-        hpWashCount > 0
-          ? `蓝不足转扩蓝×${mpWashCount} [${mpDetails.join(', ')}]`
-          : `蓝不足改扩蓝×${mpWashCount} [${mpDetails.join(', ')}]`,
-      );
+      segments.push({
+        text:
+          hpWashCount > 0
+            ? `蓝不足转扩蓝×${mpWashCount} [${formatMpWashNet(totalNetMp)}]`
+            : `蓝不足改扩蓝×${mpWashCount} [${formatMpWashNet(totalNetMp)}]`,
+        details: mpDetails,
+      });
     } else if (hpWashCount === 0) {
-      parts.push('洗血/扩蓝均失败');
+      segments.push({ text: '洗血/扩蓝均失败' });
       if (!warning) {
         warning = true;
         warningMessage = 'MP 不足以洗血或扩蓝';
       }
     }
   } else if (hpWashCount === 0) {
-    parts.push('洗血失败');
+    segments.push({ text: '洗血失败' });
     warning = true;
     warningMessage = '洗血失败';
   }
 
   return {
-    operation: parts.join(' → '),
+    operation: segments.map((segment) => segment.text).join(' → '),
+    segments,
     warning,
     warningMessage,
     unusedAp: Math.max(0, apCount - usedAp),
@@ -966,11 +1120,46 @@ export function validateParams(params) {
   if (params.targetInt < params.baseStats.int) {
     errors.push('目标智力不能低于初始智力');
   }
-  if (params.equipInt < 0) {
-    errors.push('装备智力不能为负数');
+  const bonuses = resolveEquipIntBonuses(params);
+  for (const entry of bonuses) {
+    if (entry.level < 1 || entry.level > 200) {
+      errors.push('装备智力生效等级需在 1 ~ 200 之间');
+      break;
+    }
   }
 
   return errors;
+}
+
+/**
+ * 给洗血/扩蓝分段追加备注（如 INT已满）
+ * @param {{ segments?: OperationSegment[]; operation: string }} washResult
+ * @param {string} [leftover]
+ * @param {string} [note]
+ * @returns {OperationSegment[]}
+ */
+function annotateWashSegments(washResult, leftover = '', note = '') {
+  const segments = /** @type {OperationSegment[]} */ (
+    washResult.segments?.length
+      ? washResult.segments.map((segment) => ({
+          text: segment.text,
+          details: segment.details ? [...segment.details] : undefined,
+        }))
+      : [{ text: washResult.operation }]
+  );
+  if (segments.length === 0) {
+    return [{ text: `${leftover}${note}`.trim() || '洗血' }];
+  }
+  const suffix = `${leftover ? ` → ${leftover}` : ''}${note}`;
+  if (!suffix) {
+    return segments;
+  }
+  const last = segments[segments.length - 1];
+  segments[segments.length - 1] = {
+    ...last,
+    text: `${last.text}${suffix}`,
+  };
+  return segments;
 }
 
 /**
@@ -984,6 +1173,7 @@ function buildLevelRecord(input) {
     hpGain: input.hpGain,
     mpGain: input.mpGain,
     operation: input.operation,
+    operationSegments: input.operationSegments,
     warning: input.warning,
     warningMessage: input.warningMessage,
     hp: input.state.hp,
@@ -1034,7 +1224,6 @@ export function runSimulation(params) {
     job,
     baseStats,
     targetInt,
-    equipInt,
     targetLevel,
     mwStartLevel,
     mwLevel,
@@ -1044,7 +1233,9 @@ export function runSimulation(params) {
       butterflyRing: false,
       monNecklace: false,
     },
+    noActiveMpExpand = false,
   } = params;
+  const equipIntBonuses = resolveEquipIntBonuses(params);
   const washGoalLevel = targetLevel;
   const equipmentHp = getEquipmentHpBonus(hpEquipment);
   const washTargetHp = getWashTargetHp(equipmentHp);
@@ -1088,13 +1279,22 @@ export function runSimulation(params) {
   /** 法师：峰值蓝达到 3 万后进入持续洗血阶段 */
   let mageWashPhase = state.mp >= MAX_MP;
   for (let level = 2; level <= targetLevel; level += 1) {
+    // 先分配当级 SP，使生命强化/魔力强化当级生效（与预估路径一致）
+    const spResult = allocateSkillPoints(state.skills, job, level);
+    state.skills = spResult.skills;
+
     const [hpMin, hpMax] = getHpGrowthRange(job, level);
     const [mpMin, mpMax] = getMpGrowthRange(job);
     const enhancementForGrowth = state.skills.lifeEnhancement;
-    const skillBonusForGrowth = getLifeEnhancementHpBonus(job, enhancementForGrowth);
+    const skillBonusForGrowth = getLifeEnhancementHpBonus(
+      job,
+      enhancementForGrowth,
+      'levelUp',
+    );
     const baseHpGain = randomInt(hpMin, hpMax);
     const rawHpGain = baseHpGain + skillBonusForGrowth;
     const hpGain = capHpGain(state.hp, rawHpGain, washTargetHp);
+    const equipInt = getEquipIntAtLevel(equipIntBonuses, level);
     const intMpBonus = getLevelUpIntMpBonus(
       state.int,
       equipInt,
@@ -1155,20 +1355,37 @@ export function runSimulation(params) {
     }
     const mpDetail =
       mpDetailParts.length > 0 ? `(${mpDetailParts.join(', ')})` : '';
+
+    /** 操作顺序：SP 加点 → 防溢出 → 自然成长（生命强化按当前技能等级计入） */
     const operationParts = [
+      ...(spResult.description ? [spResult.description] : []),
       ...preWashParts,
       hpGain < rawHpGain
-        ? `自然成长 ${formatHpGainDetail(baseHpGain, skillBonusForGrowth)}→封顶 HP+${hpGain} MP+${mpGain}${mpDetail}`
-        : `自然成长 ${formatHpGainDetail(baseHpGain, skillBonusForGrowth)} MP+${mpGain}${mpDetail}`,
+        ? `自然成长 ${formatHpGainDetail(baseHpGain, skillBonusForGrowth, enhancementForGrowth)}→封顶 HP+${hpGain} MP+${mpGain}${mpDetail}`
+        : `自然成长 ${formatHpGainDetail(baseHpGain, skillBonusForGrowth, enhancementForGrowth)} MP+${mpGain}${mpDetail}`,
     ];
+    /** @type {OperationSegment[]} */
+    const operationSegments = operationParts.map((text) => ({ text }));
     let warning = false;
     let warningMessage = '';
 
-    const spResult = allocateSkillPoints(state.skills, job, level);
-    state.skills = spResult.skills;
-    if (spResult.description) {
-      operationParts.push(spResult.description);
-    }
+    /**
+     * @param {string} text
+     */
+    const pushPlain = (text) => {
+      operationParts.push(text);
+      operationSegments.push({ text });
+    };
+
+    /**
+     * @param {OperationSegment[]} segments
+     */
+    const pushSegments = (segments) => {
+      for (const segment of segments) {
+        operationParts.push(segment.text);
+        operationSegments.push(segment);
+      }
+    };
 
     if (hasGraduated) {
       const allocated = allocateLevelUpAp(
@@ -1178,7 +1395,7 @@ export function runSimulation(params) {
         FRESH_AP_PER_LEVEL,
         true,
       );
-      operationParts.push(
+      pushPlain(
         `出山后正常升级 (${formatApAllocation(allocated)}，AP 全加主属性)`,
       );
     } else if (isMagicianClass(job)) {
@@ -1192,7 +1409,7 @@ export function runSimulation(params) {
           FRESH_AP_PER_LEVEL,
           true,
         );
-        operationParts.push(
+        pushPlain(
           `血量目标已达成，本级 AP 加主属性 (${formatApAllocation(allocated)})`,
         );
       } else {
@@ -1269,7 +1486,7 @@ export function runSimulation(params) {
         if (leftover) {
           stepParts.push(leftover);
         }
-        operationParts.push(stepParts.join(' → ') || '法师本级无操作');
+        pushPlain(stepParts.join(' → ') || '法师本级无操作');
       }
     } else if (state.int >= targetInt) {
       // 智能路径：INT 加满后优先洗血；蓝不够自动扩蓝；能靠自然成长达标则提前出山
@@ -1292,7 +1509,7 @@ export function runSimulation(params) {
           FRESH_AP_PER_LEVEL,
           true,
         );
-        operationParts.push(
+        pushPlain(
           shouldSaveNx
             ? `智能节约NX：预计 Lv.${washGoalLevel} 自然成长可达洗血目标 ${washTargetHp.toLocaleString('zh-CN')} HP，本级停止洗血 (${formatApAllocation(allocated)})`
             : `洗血目标已达成，本级 AP 加主属性 (${formatApAllocation(allocated)})`,
@@ -1307,6 +1524,8 @@ export function runSimulation(params) {
           mwStartLevel,
           '智能洗血',
           washTargetHp,
+          FRESH_AP_PER_LEVEL,
+          noActiveMpExpand,
         );
         if (washResult.warning) {
           warning = true;
@@ -1314,10 +1533,8 @@ export function runSimulation(params) {
           warningMessage = washResult.warningMessage;
         }
         const leftover = dumpFreshApToMain(state, job, washResult.unusedAp);
-        operationParts.push(
-          leftover
-            ? `${washResult.operation} → ${leftover}（INT已满）`
-            : `${washResult.operation}（INT已满）`,
+        pushSegments(
+          annotateWashSegments(washResult, leftover, '（INT已满）'),
         );
       }
     } else {
@@ -1330,14 +1547,17 @@ export function runSimulation(params) {
         false,
         false,
       );
-      const stepParts = /** @type {string[]} */ ([]);
+      /** @type {OperationSegment[]} */
+      const stepSegments = [];
       if (
         allocated.str > 0 ||
         allocated.dex > 0 ||
         allocated.int > 0 ||
         allocated.luk > 0
       ) {
-        stepParts.push(`补属性 (${formatApAllocation(allocated)})`);
+        stepSegments.push({
+          text: `补属性 (${formatApAllocation(allocated)})`,
+        });
       }
 
       let remainingAp = allocated.overflow;
@@ -1361,11 +1581,11 @@ export function runSimulation(params) {
               remainingAp,
               true,
             );
-            stepParts.push(
-              shouldSaveNx
+            stepSegments.push({
+              text: shouldSaveNx
                 ? `智能节约NX：剩余 AP 加主属性 (${formatApAllocation(mainAlloc)})`
                 : `洗血目标已达成，剩余 AP 加主属性 (${formatApAllocation(mainAlloc)})`,
-            );
+            });
           } else {
             const washResult = runFreshHpWashWithMpFallback(
               state,
@@ -1377,6 +1597,7 @@ export function runSimulation(params) {
               '智能洗血',
               washTargetHp,
               remainingAp,
+              noActiveMpExpand,
             );
             if (washResult.warning) {
               warning = true;
@@ -1384,10 +1605,12 @@ export function runSimulation(params) {
               warningMessage = washResult.warningMessage;
             }
             const leftover = dumpFreshApToMain(state, job, washResult.unusedAp);
-            stepParts.push(
-              leftover
-                ? `${washResult.operation} → ${leftover}（INT刚满，剩余AP洗血）`
-                : `${washResult.operation}（INT刚满，剩余AP洗血）`,
+            stepSegments.push(
+              ...annotateWashSegments(
+                washResult,
+                leftover,
+                '（INT刚满，剩余AP洗血）',
+              ),
             );
           }
       } else if (remainingAp > 0) {
@@ -1398,12 +1621,18 @@ export function runSimulation(params) {
           remainingAp,
           true,
         );
-        stepParts.push(`剩余 AP 加主属性 (${formatApAllocation(mainAlloc)})`);
+        stepSegments.push({
+          text: `剩余 AP 加主属性 (${formatApAllocation(mainAlloc)})`,
+        });
       }
 
-      operationParts.push(
-        `${stepParts.join(' → ') || '正常升级'}，当前 INT ${state.int}/${targetInt}`,
-      );
+      if (stepSegments.length === 0) {
+        stepSegments.push({ text: '正常升级' });
+      }
+      stepSegments.push({
+        text: `当前 INT ${state.int}/${targetInt}`,
+      });
+      pushSegments(stepSegments);
     }
 
     if (!hasGraduated) {
@@ -1434,11 +1663,11 @@ export function runSimulation(params) {
         graduationLevel = level;
         hasGraduated = true;
         if (graduation.count > 0) {
-          operationParts.push(
+          pushPlain(
             `出山 Lv.${level}：洗净副属性转主属性×${graduation.count} (${graduation.detail}，消耗${graduation.count}张APR，不扣MP)`,
           );
         } else {
-          operationParts.push(
+          pushPlain(
             `出山 Lv.${level}：停止洗血，此后 AP 全加主属性`,
           );
         }
@@ -1457,7 +1686,8 @@ export function runSimulation(params) {
         level,
         hpGain,
         mpGain,
-        operation: operationParts.join(' → '),
+        operation: operationSegments.map((segment) => segment.text).join(' → '),
+        operationSegments,
         warning,
         warningMessage: warning ? warningMessage : undefined,
         state,
@@ -1471,7 +1701,7 @@ export function runSimulation(params) {
     state.mp,
     targetLevel,
     state.int,
-    equipInt,
+    equipIntBonuses,
     job,
     mwLevel,
     mwStartLevel,
@@ -1505,9 +1735,9 @@ export function runSimulation(params) {
 }
 
 /**
- * 自动寻找满足 HP 与 200 级目标 MP 时总 NX 最低的目标 INT。
+ * 自动寻找满足 HP（与可选的 200 级目标 MP）时总 NX 最低的目标 INT。
  * @param {Omit<SimulationParams, 'targetInt' | 'reserveMp'>} params
- * @param {number} targetMpAt200
+ * @param {number | null | undefined} targetMpAt200 留空/null 表示不强制目标蓝，按推演结果为准
  * @returns {SimulationResult}
  */
 export function optimizeTargetInt(params, targetMpAt200) {
@@ -1516,11 +1746,19 @@ export function optimizeTargetInt(params, targetMpAt200) {
     999,
     baseInt + FRESH_AP_PER_LEVEL * Math.max(0, params.targetLevel - 1),
   );
+  const hasMpTarget =
+    typeof targetMpAt200 === 'number' &&
+    Number.isFinite(targetMpAt200) &&
+    targetMpAt200 > 0;
   const trialsPerInt = 5;
   const isMage = isMagicianClass(params.job);
+  const equipIntForExpandGate = getEquipIntAtLevel(
+    resolveEquipIntBonuses(params),
+    Math.max(1, params.targetLevel),
+  );
   const magicianExpandStartInt = Math.max(
     baseInt,
-    130 - Math.max(0, params.equipInt),
+    130 - Math.max(0, equipIntForExpandGate),
   );
   const targetIntCandidates = isMage
     ? [Math.min(maxAvailableInt, magicianExpandStartInt)]
@@ -1624,9 +1862,10 @@ export function optimizeTargetInt(params, targetMpAt200) {
         bestTargetInt = targetInt;
       }
     } else if (
-      averageCompleteMp >= targetMpAt200 &&
+      (!hasMpTarget || averageCompleteMp >= /** @type {number} */ (targetMpAt200)) &&
       averageCompleteNx < bestAverageNx
     ) {
+      // 未设置目标蓝：只要求洗血完成，取 NX 最低；有目标则同时满足蓝量
       bestAverageNx = averageCompleteNx;
       bestTargetInt = targetInt;
     }
@@ -1647,7 +1886,9 @@ export function optimizeTargetInt(params, targetMpAt200) {
       isMage
         ? (selectedResult.peakMp ?? 0) < MAX_MP ||
           selectedResult.graduationLevel === null
-        : selectedResult.projectedMpAt200 < targetMpAt200 ||
+        : (hasMpTarget &&
+            selectedResult.projectedMpAt200 <
+              /** @type {number} */ (targetMpAt200)) ||
           selectedResult.finalHp < MAX_HP ||
           selectedResult.graduationLevel === null
     );
@@ -1660,10 +1901,35 @@ export function optimizeTargetInt(params, targetMpAt200) {
     });
   }
 
+  const defaultAllInt = isDefaultAllIntStrategy(params.job);
+  /** 法师默认即「全加 INT」路径，与推荐方案一致；其他职业按固定默认 INT 再跑一遍 */
+  const defaultTargetInt = defaultAllInt
+    ? null
+    : (getDefaultTargetInt(params.job) ?? baseInt);
+  const defaultPlan = defaultAllInt
+    ? selectedResult
+    : runSimulation({
+        ...params,
+        targetInt: /** @type {number} */ (defaultTargetInt),
+        reserveMp: 0,
+      });
+
   return {
     ...selectedResult,
     optimalTargetInt: selectedTargetInt,
-    optimizationTargetMp: targetMpAt200,
+    defaultTargetInt,
+    defaultAllInt,
+    defaultPlan: {
+      ...defaultPlan,
+      optimalTargetInt: defaultAllInt
+        ? selectedTargetInt
+        : /** @type {number} */ (defaultTargetInt),
+      defaultTargetInt,
+      defaultAllInt,
+      optimizationTargetMp: hasMpTarget ? targetMpAt200 : null,
+      optimizationFeasible: defaultPlan.graduationLevel !== null,
+    },
+    optimizationTargetMp: hasMpTarget ? targetMpAt200 : null,
     optimizationFeasible: bestTargetInt !== null,
   };
 }

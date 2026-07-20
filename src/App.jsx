@@ -1,15 +1,24 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import {
   getDefaultBaseStats,
+  getDefaultTargetInt,
+  getEquipIntAtLevel,
   HP_EQUIPMENT_OPTIONS,
   JOB_OPTIONS,
   MAX_HP,
   MAX_MP,
   MW_OPTIONS,
+  isDefaultAllIntStrategy,
 } from './config/jobConfig.js';
 import { optimizeTargetInt } from './utils/simulation.js';
 
 /** @typedef {import('./config/jobConfig.js').JobId} JobId */
+
+/**
+ * @typedef {Object} OperationSegment
+ * @property {string} text
+ * @property {string[]} [details]
+ */
 
 /**
  * 格式化数字（千分位）
@@ -18,6 +27,82 @@ import { optimizeTargetInt } from './utils/simulation.js';
  */
 function formatNumber(value) {
   return value.toLocaleString('zh-CN');
+}
+
+/**
+ * 可悬浮查看逐次明细的操作文案
+ * @param {Object} props
+ * @param {string} props.operation
+ * @param {OperationSegment[]} [props.segments]
+ */
+function OperationText({ operation, segments }) {
+  const items =
+    Array.isArray(segments) && segments.length > 0
+      ? segments
+      : [{ text: operation }];
+
+  return (
+    <span className="inline leading-relaxed">
+      {items.map((segment, index) => (
+        <Fragment key={`${segment.text}-${index}`}>
+          {index > 0 ? <span className="text-neutral-400"> → </span> : null}
+          {segment.details?.length ? (
+            <HoverDetail text={segment.text} details={segment.details} />
+          ) : (
+            <span>{segment.text}</span>
+          )}
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * 悬浮展示逐次洗血/扩蓝数值
+ * @param {Object} props
+ * @param {string} props.text
+ * @param {string[]} props.details
+ */
+function HoverDetail({ text, details }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+
+  /**
+   * @param {import('react').MouseEvent<HTMLSpanElement>} event
+   */
+  const handleEnter = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPos({
+      x: Math.min(rect.left, window.innerWidth - 320),
+      y: rect.bottom + 8,
+    });
+    setOpen(true);
+  };
+
+  return (
+    <span
+      className="cursor-help border-b border-dotted border-sky-500/70 text-sky-800"
+      onMouseEnter={handleEnter}
+      onMouseLeave={() => setOpen(false)}
+    >
+      {text}
+      {open ? (
+        <span
+          className="pointer-events-none fixed z-50 max-w-xs rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-[11px] leading-5 text-neutral-700 shadow-lg"
+          style={{ left: pos.x, top: pos.y }}
+        >
+          <span className="mb-1 block font-semibold text-neutral-900">
+            逐次明细
+          </span>
+          {details.map((line) => (
+            <span key={line} className="block tabular-nums">
+              {line}
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </span>
+  );
 }
 
 /**
@@ -72,15 +157,18 @@ const selectClassName =
 
 export default function App() {
   /** @type {[JobId, React.Dispatch<React.SetStateAction<JobId>>]} */
-  const [job, setJob] = useState('warrior');
-  const warriorDefaults = getDefaultBaseStats('warrior');
+  const [job, setJob] = useState('warriorHero');
+  const warriorDefaults = getDefaultBaseStats('warriorHero');
   const [baseStr, setBaseStr] = useState(warriorDefaults.str);
   const [baseDex, setBaseDex] = useState(warriorDefaults.dex);
   const [baseInt, setBaseInt] = useState(warriorDefaults.int);
   const [baseLuk, setBaseLuk] = useState(warriorDefaults.luk);
-  const [equipInt, setEquipInt] = useState(0);
+  const [equipIntBonuses, setEquipIntBonuses] = useState(
+    /** @type {{ id: string; level: string; int: string }[]} */ ([]),
+  );
+  const [noActiveMpExpand, setNoActiveMpExpand] = useState(false);
   const [targetLevel, setTargetLevel] = useState(135);
-  const [targetMpAt200, setTargetMpAt200] = useState(1000);
+  const [targetMpAt200, setTargetMpAt200] = useState('');
   const [mwStartLevel, setMwStartLevel] = useState(10);
   /** @type {[import('./config/jobConfig.js').MwLevel, React.Dispatch<React.SetStateAction<import('./config/jobConfig.js').MwLevel>>]} */
   const [mwLevel, setMwLevel] = useState(20);
@@ -88,6 +176,8 @@ export default function App() {
   const [equipButterflyRing, setEquipButterflyRing] = useState(false);
   const [equipMonNecklace, setEquipMonNecklace] = useState(false);
   const [result, setResult] = useState(null);
+  /** @type {['optimal' | 'default', React.Dispatch<React.SetStateAction<'optimal' | 'default'>>]} */
+  const [planView, setPlanView] = useState('optimal');
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
 
@@ -110,8 +200,12 @@ export default function App() {
   const handleRun = () => {
     setResult(null);
     setIsDetailsOpen(false);
+    setPlanView('optimal');
     setIsRunning(true);
     requestAnimationFrame(() => {
+      const rawTargetMp = String(targetMpAt200).trim();
+      const parsedTargetMp =
+        rawTargetMp === '' ? null : Number(rawTargetMp);
       const simulationResult = optimizeTargetInt({
         job,
         baseStats: {
@@ -120,16 +214,30 @@ export default function App() {
           int: Number(baseInt),
           luk: Number(baseLuk),
         },
-        equipInt: Number(equipInt),
+        equipIntBonuses: equipIntBonuses
+          .map((row) => ({
+            level: Number(row.level),
+            int: Number(row.int),
+          }))
+          .filter(
+            (row) =>
+              Number.isFinite(row.level) &&
+              row.level >= 1 &&
+              Number.isFinite(row.int) &&
+              row.int > 0,
+          ),
         targetLevel: Number(targetLevel),
         mwStartLevel: Number(mwStartLevel),
         mwLevel: /** @type {import('./config/jobConfig.js').MwLevel} */ (Number(mwLevel)),
+        noActiveMpExpand,
         hpEquipment: {
           t10Ring: equipT10Ring,
           butterflyRing: equipButterflyRing,
           monNecklace: equipMonNecklace,
         },
-      }, Number(targetMpAt200));
+      }, parsedTargetMp !== null && Number.isFinite(parsedTargetMp)
+        ? parsedTargetMp
+        : null);
       setResult(simulationResult);
       setIsRunning(false);
     });
@@ -215,15 +323,107 @@ export default function App() {
                 </div>
               </div>
 
-              <FormField label="装备附加总智力" hint="仅影响升级自然 MP 增长">
+              <div>
+                <p className="mb-1 text-sm font-medium text-neutral-700">
+                  装备附加智力
+                </p>
+                <p className="mb-2 text-xs text-neutral-400">
+                  按等级叠加生效。例：7 级 +20，50 级再 +17 → 50 级起共 37
+                </p>
+                <div className="space-y-2">
+                  {equipIntBonuses.map((row, index) => {
+                    const levelNum = Number(row.level);
+                    const runningTotal = getEquipIntAtLevel(
+                      equipIntBonuses.map((item) => ({
+                        level: Number(item.level),
+                        int: Number(item.int),
+                      })),
+                      Number.isFinite(levelNum) ? levelNum : 1,
+                    );
+                    return (
+                      <div key={row.id} className="flex items-center gap-2">
+                        <input
+                          className={inputClassName}
+                          type="number"
+                          min={1}
+                          max={200}
+                          placeholder="等级"
+                          value={row.level}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            setEquipIntBonuses((prev) =>
+                              prev.map((item, i) =>
+                                i === index ? { ...item, level: value } : item,
+                              ),
+                            );
+                          }}
+                        />
+                        <span className="shrink-0 text-xs text-neutral-400">级 +</span>
+                        <input
+                          className={inputClassName}
+                          type="number"
+                          min={0}
+                          placeholder="INT"
+                          value={row.int}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            setEquipIntBonuses((prev) =>
+                              prev.map((item, i) =>
+                                i === index ? { ...item, int: value } : item,
+                              ),
+                            );
+                          }}
+                        />
+                        <span className="shrink-0 text-xs tabular-nums text-neutral-400">
+                          合计 {Number.isFinite(runningTotal) ? runningTotal : 0}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label="删除"
+                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-200 text-sm leading-none text-neutral-500 hover:bg-neutral-50 hover:text-neutral-800"
+                          onClick={() =>
+                            setEquipIntBonuses((prev) =>
+                              prev.filter((_, i) => i !== index),
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    className="w-full rounded-lg border border-dashed border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:border-neutral-400 hover:bg-neutral-50"
+                    onClick={() =>
+                      setEquipIntBonuses((prev) => [
+                        ...prev,
+                        {
+                          id: `${Date.now()}-${prev.length}`,
+                          level: prev.length === 0 ? '7' : '',
+                          int: '',
+                        },
+                      ])
+                    }
+                  >
+                    + 添加装备智力
+                  </button>
+                </div>
+              </div>
+              <label className="flex cursor-pointer items-start gap-2 text-sm text-neutral-700">
                 <input
-                  className={inputClassName}
-                  type="number"
-                  min={0}
-                  value={equipInt}
-                  onChange={(e) => setEquipInt(e.target.value)}
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 rounded border-neutral-300"
+                  checked={noActiveMpExpand}
+                  onChange={(e) => setNoActiveMpExpand(e.target.checked)}
                 />
-              </FormField>
+                <span>
+                  <span className="font-medium">不主动扩蓝</span>
+                  <span className="mt-0.5 block text-xs text-neutral-400">
+                    默认关闭；开启后蓝量不足时等待自然增长，不再主动扩蓝
+                  </span>
+                </span>
+              </label>
             </div>
           </section>
 
@@ -248,13 +448,14 @@ export default function App() {
                 hint={
                   job === 'magician'
                     ? '法师不计 NX：前期 AP 全加 INT；当“加 MP−退 30 MP”净收益转正后开始扩蓝，峰值达到 3 万后持续洗血'
-                    : '系统自动寻找满足此 MP 目标且总 NX 最低的面板 INT；按停止洗血后自然成长上限预测'
+                    : '可留空：不强制目标蓝，按默认推演结果；填写后系统寻找满足该 MP 且总 NX 最低的面板 INT'
                 }
               >
                 <input
                   className={inputClassName}
                   type="number"
                   min={0}
+                  placeholder="留空 = 不设目标"
                   value={targetMpAt200}
                   onChange={(e) => setTargetMpAt200(e.target.value)}
                 />
@@ -378,16 +579,33 @@ export default function App() {
             </div>
           ) : result && !result.validationErrors.length ? (
             <>
-              {result.hasWarning ? (
+              {(() => {
+                const isMageDefaultAllInt =
+                  job === 'magician' ||
+                  result.defaultAllInt ||
+                  isDefaultAllIntStrategy(job);
+                const activePlan =
+                  !isMageDefaultAllInt &&
+                  planView === 'default' &&
+                  result.defaultPlan
+                    ? result.defaultPlan
+                    : result;
+                const defaultInt =
+                  result.defaultTargetInt ?? getDefaultTargetInt(job);
+                return (
+            <>
+              {activePlan.hasWarning ? (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
                   模拟过程中出现 MP 触底警告，部分等级的洗点/扩蓝操作已中断。
                 </div>
               ) : null}
-              {result.optimizationFeasible === false ? (
+              {planView === 'optimal' && result.optimizationFeasible === false ? (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
                   {job === 'magician'
                     ? `当前未能让峰值 MP 达到 ${MAX_MP.toLocaleString('zh-CN')} 并出山，已展示峰值蓝/最终血尽量高的方案。`
-                    : '当前等级与属性点范围内无法满足 200 级目标 MP，已展示可达到 MP 最高的方案。'}
+                    : String(targetMpAt200).trim() === ''
+                      ? '当前等级与属性点范围内未能完成洗血出山，已展示最终血量尽量高的方案。'
+                      : '当前等级与属性点范围内无法满足 200 级目标 MP，已展示可达到 MP 最高的方案。'}
                 </div>
               ) : null}
 
@@ -395,43 +613,79 @@ export default function App() {
                 <div className="border-b border-neutral-100 bg-gradient-to-br from-blue-50/80 via-white to-amber-50/50 p-6">
                   <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
                     <div>
-                      <h2 className="text-base font-semibold text-neutral-950">最优洗血方案</h2>
+                      <h2 className="text-base font-semibold text-neutral-950">洗血方案</h2>
                       <p className="mt-1 text-xs text-neutral-500">
-                        系统已按目标 MP 与最低 NX 开销完成路径规划
+                        {isMageDefaultAllInt
+                          ? '法师默认：AP 全加 INT；扩蓝净收益转正后开始扩蓝，峰值满 3 万后持续洗血'
+                          : planView === 'default'
+                            ? `按职业默认 INT ${defaultInt} 推演`
+                            : String(targetMpAt200).trim() === ''
+                              ? '未设目标蓝：按洗血完成且 NX 最低规划，蓝量有多少算多少'
+                              : '系统已按目标 MP 与最低 NX 开销完成路径规划'}
                       </p>
                     </div>
-                    {result.graduationLevel ? (
-                      <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
-                        Lv.{result.graduationLevel} 出山
-                      </span>
-                    ) : null}
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!isMageDefaultAllInt ? (
+                        <div className="inline-flex rounded-lg border border-neutral-200 bg-white p-0.5 text-xs">
+                          <button
+                            type="button"
+                            className={`rounded-md px-2.5 py-1 font-medium transition ${
+                              planView === 'optimal'
+                                ? 'bg-neutral-900 text-white'
+                                : 'text-neutral-600 hover:bg-neutral-50'
+                            }`}
+                            onClick={() => setPlanView('optimal')}
+                          >
+                            最省 NX
+                          </button>
+                          <button
+                            type="button"
+                            className={`rounded-md px-2.5 py-1 font-medium transition ${
+                              planView === 'default'
+                                ? 'bg-neutral-900 text-white'
+                                : 'text-neutral-600 hover:bg-neutral-50'
+                            }`}
+                            onClick={() => setPlanView('default')}
+                          >
+                            默认 INT {defaultInt}
+                          </button>
+                        </div>
+                      ) : null}
+                      {activePlan.graduationLevel ? (
+                        <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                          Lv.{activePlan.graduationLevel} 出山
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
 
-                  <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
+                  <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-5">
                     <SummaryMetric
                       label="最终 HP"
-                      value={formatNumber(result.finalHp)}
+                      value={formatNumber(activePlan.finalHp)}
                       emphasized
                       subtitle={
-                        result.equipmentHp > 0
-                          ? `基础 ${formatNumber(result.finalBaseHp)} + 装备 ${formatNumber(result.equipmentHp)}`
-                          : `洗血目标 ${formatNumber(result.washTargetHp)} · 已达成`
+                        activePlan.equipmentHp > 0
+                          ? `基础 ${formatNumber(activePlan.finalBaseHp)} + 装备 ${formatNumber(activePlan.equipmentHp)}`
+                          : `洗血目标 ${formatNumber(activePlan.washTargetHp)} · 已达成`
                       }
                     />
                     <SummaryMetric
                       label={job === 'magician' ? '峰值 MP' : 'Lv.200 预测 MP'}
                       value={formatNumber(
                         job === 'magician'
-                          ? (result.peakMp ?? result.finalMp)
-                          : result.projectedMpAt200,
+                          ? (activePlan.peakMp ?? activePlan.finalMp)
+                          : activePlan.projectedMpAt200,
                       )}
                       emphasized
                       subtitle={
                         job === 'magician'
-                          ? result.mpCapLevel
-                            ? `首次满蓝 Lv.${result.mpCapLevel} · 上限 ${formatNumber(MAX_MP)}`
+                          ? activePlan.mpCapLevel
+                            ? `首次满蓝 Lv.${activePlan.mpCapLevel} · 上限 ${formatNumber(MAX_MP)}`
                             : `目标满蓝 ${formatNumber(MAX_MP)}`
-                          : `目标 ${formatNumber(Number(targetMpAt200))}`
+                          : String(targetMpAt200).trim() === ''
+                            ? '未设目标 · 按推演结果'
+                            : `目标 ${formatNumber(Number(targetMpAt200))}`
                       }
                     />
                     <SummaryMetric
@@ -445,10 +699,20 @@ export default function App() {
                       }
                     />
                     <SummaryMetric
-                      label="总 NX 开销"
-                      value={formatNumber(result.totalNx)}
+                      label="默认策略"
+                      value={isMageDefaultAllInt ? '全加 INT' : defaultInt}
                       emphasized
-                      subtitle={`${formatNumber(result.totalApr)} 张 APR × 3,500`}
+                      subtitle={
+                        isMageDefaultAllInt
+                          ? '不设固定 INT 目标'
+                          : JOB_OPTIONS[job].label
+                      }
+                    />
+                    <SummaryMetric
+                      label="总 NX 开销"
+                      value={formatNumber(activePlan.totalNx)}
+                      emphasized
+                      subtitle={`${formatNumber(activePlan.totalApr)} 张 APR × 3,500`}
                     />
                   </div>
                 </div>
@@ -457,41 +721,44 @@ export default function App() {
                   <div className="p-4">
                     <SummaryMetric
                       label={`Lv.${targetLevel} MP`}
-                      value={formatNumber(result.finalMp)}
+                      value={formatNumber(activePlan.finalMp)}
                     />
                   </div>
                   <div className="p-4">
-                    <SummaryMetric label="最终 STR" value={result.finalStats.str} />
+                    <SummaryMetric label="最终 STR" value={activePlan.finalStats.str} />
                   </div>
                   <div className="p-4">
-                    <SummaryMetric label="最终 DEX" value={result.finalStats.dex} />
+                    <SummaryMetric label="最终 DEX" value={activePlan.finalStats.dex} />
                   </div>
                   <div className="p-4">
-                    <SummaryMetric label="最终 INT" value={result.finalStats.int} />
+                    <SummaryMetric label="最终 INT" value={activePlan.finalStats.int} />
                   </div>
                   <div className="p-4">
-                    <SummaryMetric label="最终 LUK" value={result.finalStats.luk} />
+                    <SummaryMetric label="最终 LUK" value={activePlan.finalStats.luk} />
                   </div>
                   <div className="p-4">
                     <SummaryMetric
                       label="出山等级"
-                      value={result.graduationLevel ? `Lv.${result.graduationLevel}` : '—'}
+                      value={activePlan.graduationLevel ? `Lv.${activePlan.graduationLevel}` : '—'}
                     />
                   </div>
                   <div className="p-4">
                     <SummaryMetric
-                      label={result.finalMagicBoost > 0 ? '魔力强化' : '生命强化'}
+                      label={activePlan.finalMagicBoost > 0 ? '魔力强化' : '生命强化'}
                       value={
-                        result.finalMagicBoost > 0
-                          ? `Lv.${result.finalMagicBoost}`
-                          : result.finalLifeEnhancement > 0
-                            ? `Lv.${result.finalLifeEnhancement}`
+                        activePlan.finalMagicBoost > 0
+                          ? `Lv.${activePlan.finalMagicBoost}`
+                          : activePlan.finalLifeEnhancement > 0
+                            ? `Lv.${activePlan.finalLifeEnhancement}`
                             : '—'
                       }
                     />
                   </div>
                   <div className="p-4">
-                    <SummaryMetric label="消耗 APR" value={formatNumber(result.totalApr)} />
+                    <SummaryMetric
+                      label="洗血目标 HP"
+                      value={formatNumber(activePlan.washTargetHp)}
+                    />
                   </div>
                 </div>
               </section>
@@ -499,24 +766,23 @@ export default function App() {
               <section className="overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-sm">
                 <button
                   type="button"
-                  aria-expanded={isDetailsOpen}
+                  className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-neutral-50"
                   onClick={() => setIsDetailsOpen((open) => !open)}
-                  className={`flex w-full items-center justify-between px-5 py-4 text-left transition hover:bg-neutral-50 ${
-                    isDetailsOpen ? 'border-b border-neutral-200' : ''
-                  }`}
                 >
                   <div>
                     <h2 className="text-sm font-semibold text-neutral-900">逐级模拟明细</h2>
-                    <p className="mt-0.5 text-xs text-neutral-500">
-                      共 {result.records.length} 条记录 · 展开后显示全部
+                    <p className="mt-0.5 text-xs text-neutral-400">
+                      共 {activePlan.records.length} 条记录 · 展开后显示全部
+                      {isMageDefaultAllInt
+                        ? ' · 全加 INT'
+                        : planView === 'default'
+                          ? ` · 默认 INT ${defaultInt}`
+                          : ' · 最省 NX'}
                     </p>
                   </div>
-                  <span className="ml-4 flex shrink-0 items-center gap-2 text-sm font-medium text-neutral-600">
-                    {isDetailsOpen ? '收起' : '展开'}
+                  <span className="text-neutral-400">
                     <svg
-                      className={`h-4 w-4 transition-transform ${
-                        isDetailsOpen ? 'rotate-180' : ''
-                      }`}
+                      className={`h-5 w-5 transition ${isDetailsOpen ? 'rotate-180' : ''}`}
                       viewBox="0 0 20 20"
                       fill="none"
                       stroke="currentColor"
@@ -546,7 +812,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-neutral-100">
-                      {result.records.map((row) => (
+                      {activePlan.records.map((row) => (
                         <tr
                           key={row.level}
                           className={
@@ -572,8 +838,11 @@ export default function App() {
                           <td className="px-4 py-2.5 tabular-nums text-neutral-600">
                             {row.mpGain > 0 ? `+${row.mpGain}` : '—'}
                           </td>
-                          <td className="max-w-sm px-4 py-2.5 text-xs leading-relaxed text-neutral-600">
-                            {row.operation}
+                          <td className="max-w-md px-4 py-2.5 text-xs leading-relaxed text-neutral-600">
+                            <OperationText
+                              operation={row.operation}
+                              segments={row.operationSegments}
+                            />
                           </td>
                           <td className="px-4 py-2.5 text-right text-xs tabular-nums text-neutral-500">
                             {row.str}/{row.dex}/{row.int}/{row.luk}
@@ -605,6 +874,9 @@ export default function App() {
                 ) : null}
               </section>
             </>
+                );
+              })()}
+            </>
           ) : (
             <div className="flex min-h-[420px] flex-col items-center justify-center rounded-xl border border-dashed border-neutral-200 bg-white p-12 text-center">
               <div className="rounded-full bg-neutral-100 p-4">
@@ -626,7 +898,7 @@ export default function App() {
                 配置参数后开始模拟
               </h2>
               <p className="mt-2 max-w-md text-sm text-neutral-500">
-                设置目标等级与 200 级目标 MP 后点击「开始模拟」。系统会自动选择最优
+                设置目标等级后点击「开始模拟」。200 级目标 MP 可留空。系统会自动选择最优
                 INT，并智能决定何时洗血、扩蓝与出山。
               </p>
             </div>

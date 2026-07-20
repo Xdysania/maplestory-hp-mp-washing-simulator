@@ -1,3 +1,5 @@
+import { isWarriorClass } from './jobConfig.js';
+
 /**
  * @typedef {import('./jobConfig.js').JobId} JobId
  */
@@ -5,7 +7,29 @@
 /** 生命强化最高等级 */
 export const LIFE_ENHANCEMENT_MAX = 10;
 
-/** 生命强化每级额外 HP（升级 / 洗血均适用） */
+/**
+ * 生命强化：自然升级时每级额外 HP
+ * 战士满级 +40；拳手满级 +30
+ * @type {Partial<Record<JobId, number>>}
+ */
+export const LIFE_ENHANCEMENT_LEVELUP_HP_PER_LEVEL = {
+  warriorHero: 4,
+  warriorPaladin: 4,
+  buccaneer: 3,
+};
+
+/**
+ * 生命强化：新鲜 AP 加 HP（洗血）时每级额外 HP
+ * 战士/拳手满级均为 +30
+ * @type {Partial<Record<JobId, number>>}
+ */
+export const LIFE_ENHANCEMENT_WASH_HP_PER_LEVEL = {
+  warriorHero: 3,
+  warriorPaladin: 3,
+  buccaneer: 3,
+};
+
+/** @deprecated 兼容旧引用；默认按洗血加成 */
 export const LIFE_ENHANCEMENT_HP_PER_LEVEL = 3;
 
 /** 生命强化解锁所需生命恢复等级 */
@@ -71,7 +95,7 @@ export const MAGICIAN_SP_SCHEDULE = {
  * @returns {boolean}
  */
 export function hasLifeEnhancement(job) {
-  return job === 'warrior' || job === 'buccaneer';
+  return isWarriorClass(job) || job === 'buccaneer';
 }
 
 /**
@@ -87,13 +111,22 @@ export function hasMagicBoost(job) {
  * 计算生命强化提供的额外 HP
  * @param {JobId} job
  * @param {number} enhancementLevel
+ * @param {'levelUp' | 'wash'} [context='wash'] 自然升级用 levelUp（战士满级+40），洗血用 wash（满级+30）
  * @returns {number}
  */
-export function getLifeEnhancementHpBonus(job, enhancementLevel) {
+export function getLifeEnhancementHpBonus(
+  job,
+  enhancementLevel,
+  context = 'wash',
+) {
   if (!hasLifeEnhancement(job) || enhancementLevel <= 0) {
     return 0;
   }
-  return enhancementLevel * LIFE_ENHANCEMENT_HP_PER_LEVEL;
+  const perLevel =
+    context === 'levelUp'
+      ? (LIFE_ENHANCEMENT_LEVELUP_HP_PER_LEVEL[job] ?? 0)
+      : (LIFE_ENHANCEMENT_WASH_HP_PER_LEVEL[job] ?? 0);
+  return enhancementLevel * perLevel;
 }
 
 /**
@@ -116,7 +149,7 @@ export function getMagicBoostMpBonus(job, magicBoostLevel) {
  * @returns {{ lifeRecovery?: number; lifeEnhancement?: number; magicBoost?: number } | null}
  */
 function getSpScheduleForLevel(job, level) {
-  if (job === 'warrior') {
+  if (isWarriorClass(job)) {
     return WARRIOR_SP_SCHEDULE[level] ?? null;
   }
   if (job === 'buccaneer') {
@@ -161,7 +194,19 @@ export function allocateSkillPoints(skills, job, level) {
       LIFE_ENHANCEMENT_MAX,
       next.lifeEnhancement + schedule.lifeEnhancement,
     );
-    parts.push(`生命强化+${schedule.lifeEnhancement}(Lv${next.lifeEnhancement})`);
+    const levelUpBonus = getLifeEnhancementHpBonus(
+      job,
+      next.lifeEnhancement,
+      'levelUp',
+    );
+    const washBonus = getLifeEnhancementHpBonus(
+      job,
+      next.lifeEnhancement,
+      'wash',
+    );
+    parts.push(
+      `生命强化+${schedule.lifeEnhancement}(Lv${next.lifeEnhancement}，升级+${levelUpBonus}/加点HP+${washBonus})`,
+    );
   }
 
   if (schedule.magicBoost) {
@@ -182,11 +227,16 @@ export function allocateSkillPoints(skills, job, level) {
  * 格式化 HP 增长明细
  * @param {number} baseHp
  * @param {number} skillBonus
+ * @param {number} [enhancementLevel=0]
  * @returns {string}
  */
-export function formatHpGainDetail(baseHp, skillBonus) {
+export function formatHpGainDetail(baseHp, skillBonus, enhancementLevel = 0) {
   if (skillBonus <= 0) {
     return `HP+${baseHp}`;
   }
-  return `HP+${baseHp + skillBonus}(基础+${baseHp} 生命强化+${skillBonus})`;
+  const skillLabel =
+    enhancementLevel > 0
+      ? `生命强化Lv${enhancementLevel}+${skillBonus}`
+      : `生命强化+${skillBonus}`;
+  return `HP+${baseHp + skillBonus}(基础+${baseHp} ${skillLabel})`;
 }
