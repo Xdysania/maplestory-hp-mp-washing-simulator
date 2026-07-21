@@ -26,6 +26,9 @@ export const MAX_HP = 30000;
 /** 法师优先堆蓝的 MP 上限（蓝满后再把蓝洗成血） */
 export const MAX_MP = 30000;
 
+/** 游戏等级上限（自然成长预览终点） */
+export const MAX_GAME_LEVEL = 200;
+
 /**
  * 可勾选的加血装备
  * @type {Record<string, { label: string; hp: number }>}
@@ -71,6 +74,9 @@ export const FRESH_AP_PER_LEVEL = 5;
 /** 单项属性的最低值 */
 export const MIN_STAT = 4;
 
+/** 二转等级（30 级前属性均可洗至 MIN_STAT；30 级须满足转职属性要求） */
+export const SECOND_JOB_LEVEL = 30;
+
 /**
  * @typedef {'str' | 'dex' | 'int' | 'luk'} StatKey
  */
@@ -97,6 +103,19 @@ export const DEFAULT_TARGET_INT = {
 };
 
 /**
+ * 各职业默认扩蓝启动 INT（未列出则等同目标 INT；法师为净收益转正门槛）
+ * @type {Partial<Record<JobId, number>>}
+ */
+export const DEFAULT_EXPAND_START_INT = {
+  warriorHero: 100,
+  warriorPaladin: 100,
+  corsair: 300,
+  archer: 280,
+  thief: 280,
+  magician: 130,
+};
+
+/**
  * 法师默认不加固定 INT 目标，而是 AP 全加 INT（至扩蓝净收益转正后再扩蓝）
  * @param {JobId} job
  * @returns {boolean}
@@ -116,7 +135,19 @@ export function getDefaultTargetInt(job) {
 }
 
 /**
- * 各职业升级 AP 分配优先级（一转前置属性出山后仍保留，不可再洗到更低）
+ * 获取职业默认扩蓝启动 INT
+ * @param {JobId} job
+ * @returns {number | null}
+ */
+export function getDefaultExpandStartInt(job) {
+  if (DEFAULT_EXPAND_START_INT[job] != null) {
+    return DEFAULT_EXPAND_START_INT[job];
+  }
+  return getDefaultTargetInt(job);
+}
+
+/**
+ * 各职业二转（30 级）前置属性要求
  * @type {Record<JobId, { prereqStat: StatKey | null; prereqTarget: number }>}
  */
 export const AP_ALLOCATION_RULES = {
@@ -130,17 +161,43 @@ export const AP_ALLOCATION_RULES = {
 };
 
 /**
- * 单项属性下限：绝对最低 MIN_STAT；一转要求的前置属性不可洗到更低
+ * 单项属性下限：30 级前均为 MIN_STAT；二转后转职前置属性不可再洗低
  * @param {JobId} job
  * @param {StatKey} stat
+ * @param {number} [level=MAX_GAME_LEVEL] 当前等级
  * @returns {number}
  */
-export function getStatFloor(job, stat) {
+export function getStatFloor(job, stat, level = MAX_GAME_LEVEL) {
+  if (level < SECOND_JOB_LEVEL) {
+    return MIN_STAT;
+  }
   const rule = AP_ALLOCATION_RULES[job];
   if (rule?.prereqStat === stat && rule.prereqTarget > MIN_STAT) {
     return rule.prereqTarget;
   }
   return MIN_STAT;
+}
+
+/**
+ * 二转（30 级）属性门槛校验
+ * @param {{ str: number; dex: number; int: number; luk: number }} state
+ * @param {JobId} job
+ * @returns {{ ok: boolean; message?: string }}
+ */
+export function checkSecondJobAdvancement(state, job) {
+  const rule = AP_ALLOCATION_RULES[job];
+  if (!rule?.prereqStat || rule.prereqTarget <= 0) {
+    return { ok: true };
+  }
+  const stat = rule.prereqStat;
+  const current = state[stat];
+  if (current < rule.prereqTarget) {
+    return {
+      ok: false,
+      message: `30级转职失败：${stat.toUpperCase()} 需 ≥ ${rule.prereqTarget}（当前 ${current}），洗血规划失败`,
+    };
+  }
+  return { ok: true };
 }
 
 /** 通用 1 级默认四属性（全职业：STR/DEX/LUK 5，INT 10） */

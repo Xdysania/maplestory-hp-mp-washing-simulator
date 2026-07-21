@@ -224,6 +224,21 @@ export function allocateSkillPoints(skills, job, level) {
 }
 
 /**
+ * 按职业 SP 计划推算指定等级时的技能状态（中途洗默认技能）
+ * @param {JobId} job
+ * @param {number} level
+ * @returns {SkillState}
+ */
+export function projectSkillsToLevel(job, level) {
+  /** @type {SkillState} */
+  let skills = { lifeRecovery: 0, lifeEnhancement: 0, magicBoost: 0 };
+  for (let lv = 2; lv <= level; lv += 1) {
+    skills = allocateSkillPoints(skills, job, lv).skills;
+  }
+  return skills;
+}
+
+/**
  * 格式化 HP 增长明细
  * @param {number} baseHp
  * @param {number} skillBonus

@@ -8,6 +8,7 @@ import {
   JOB_OPTIONS,
   MAX_HP,
   MAX_MP,
+  MAX_GAME_LEVEL,
   MIN_STAT,
   getEquipmentHpBonus,
   getWashTargetHp,
@@ -30,13 +31,18 @@ import {
   getAprMpDeduction,
   getStaleHpWashGain,
   getStatFloor,
+  checkSecondJobAdvancement,
+  SECOND_JOB_LEVEL,
+  getDefaultExpandStartInt,
 } from '../config/jobConfig.js';
 import {
   allocateSkillPoints,
   formatHpGainDetail,
   getLifeEnhancementHpBonus,
   getMagicBoostMpBonus,
+  projectSkillsToLevel,
   LIFE_ENHANCEMENT_MAX,
+  MAGIC_BOOST_MAX,
 } from '../config/skillConfig.js';
 
 /**
@@ -52,6 +58,8 @@ import {
  * @property {BaseStats} baseStats
  * @property {number} targetInt
  * @property {number} [expandStartInt] 船长/弓手/飞侠/战士：开始边扩蓝边洗血的 INT（默认=targetInt）
+ * @property {number} [preferredTargetInt] 用户设定的目标 INT（智能寻优时作种子/对照方案）
+ * @property {number} [preferredExpandStartInt] 用户设定的扩蓝启动 INT（智能寻优时作种子/对照）
  * @property {import('../config/jobConfig.js').EquipIntBonus[]} [equipIntBonuses] 按等级生效的装备智力列表
  * @property {number} [equipInt] 兼容旧参数：固定装备智力（等价于 1 级起生效）
  * @property {number} [targetLevel] 兼容旧参数：同时作为 3w 血目标与出山/模拟终点
@@ -63,6 +71,10 @@ import {
  * @property {number} [reserveMp]
  * @property {HpEquipmentFlags} [hpEquipment]
  * @property {boolean} [noActiveMpExpand] 蓝不足时不主动扩蓝，等待自然增长
+ * @property {number} [startLevel] 模拟起点等级（默认 1）；>1 时为中途洗
+ * @property {number} [startHp] 中途洗：当前 HP（不含装备加成展示用，模拟用基础 HP）
+ * @property {number} [startMp] 中途洗：当前 MP
+ * @property {SkillState} [startSkills] 中途洗：当前技能等级；未填则按等级自动推算
  */
 
 /**
@@ -80,7 +92,8 @@ import {
  * @property {OperationSegment[]} [operationSegments]
  * @property {boolean} warning
  * @property {string} [warningMessage]
- * @property {number} hp
+ * @property {number} hp 基础 HP（模拟状态）
+ * @property {number} [panelHp] 面板 HP（基础 + 装备，上限 30,000）
  * @property {number} mp
  * @property {number} str
  * @property {number} dex
@@ -91,6 +104,7 @@ import {
  * @property {number} minMp
  * @property {number} totalApr
  * @property {number} totalNx
+ * @property {boolean} [naturalPreview] 满血目标已达成后的自然成长预览行
  */
 
 /**
@@ -101,6 +115,8 @@ import {
  * @property {number} equipmentHp
  * @property {number} washTargetHp
  * @property {number} finalMp
+ * @property {number} washGoalLevel 目标 3w 血等级（洗血规划终点）
+ * @property {number} simEndLevel 模拟终点（含自然成长预览，默认 200）
  * @property {number} projectedMpAt200
  * @property {number} optimalTargetInt
  * @property {BaseStats} finalStats
@@ -135,6 +151,63 @@ import {
  * @property {number} luk
  * @property {SkillState} skills
  */
+
+/**
+ * 解析模拟起点（1 级新手 / 中途洗）
+ * @param {SimulationParams} params
+ * @param {number} graduationTargetLevel
+ * @returns {{ startLevel: number; hp: number; mp: number; skills: SkillState; hasGraduated: boolean }}
+ */
+function resolveSimulationStart(params, graduationTargetLevel) {
+  const rawLevel = Number(params.startLevel);
+  const startLevel =
+    Number.isFinite(rawLevel) && rawLevel > 1
+      ? Math.min(199, Math.max(2, Math.floor(rawLevel)))
+      : 1;
+
+  if (startLevel <= 1) {
+    const initial = INITIAL_STATS[params.job];
+    return {
+      startLevel: 1,
+      hp: initial.hp,
+      mp: initial.mp,
+      skills: { lifeRecovery: 0, lifeEnhancement: 0, magicBoost: 0 },
+      hasGraduated: false,
+    };
+  }
+
+  const hp = Number(params.startHp);
+  const mp = Number(params.startMp);
+  const skills =
+    params.startSkills && typeof params.startSkills === 'object'
+      ? {
+          lifeRecovery: params.startSkills.lifeRecovery ?? 0,
+          lifeEnhancement: params.startSkills.lifeEnhancement ?? 0,
+          magicBoost: params.startSkills.magicBoost ?? 0,
+        }
+      : projectSkillsToLevel(params.job, startLevel);
+
+  return {
+    startLevel,
+    hp,
+    mp,
+    skills,
+    hasGraduated: startLevel > graduationTargetLevel,
+  };
+}
+
+/**
+ * 解析模拟起点等级（1 或中途洗等级）
+ * @param {SimulationParams} params
+ * @returns {number}
+ */
+function resolveStartLevel(params) {
+  const raw = Number(params.startLevel);
+  if (Number.isFinite(raw) && raw > 1) {
+    return Math.min(199, Math.max(2, Math.floor(raw)));
+  }
+  return 1;
+}
 
 /**
  * 校验 MP 是否满足底线与预留值
@@ -635,6 +708,30 @@ function capHpGain(currentHp, gain, washTargetHp) {
     return 0;
   }
   return Math.min(gain, Math.max(0, washTargetHp - currentHp));
+}
+
+/**
+ * 自然升级 HP 封顶：基础 HP 可继续成长至 MAX_HP（30,000）
+ * 洗血目标 washTargetHp 仅限制洗血操作，不限制升级自然成长
+ * @param {number} currentHp
+ * @param {number} gain
+ * @returns {number}
+ */
+function capNaturalHpGain(currentHp, gain) {
+  if (gain <= 0) {
+    return 0;
+  }
+  return Math.min(gain, Math.max(0, MAX_HP - currentHp));
+}
+
+/**
+ * 面板 HP = 基础 + 装备，总上限 30,000
+ * @param {number} baseHp
+ * @param {number} equipmentHp
+ * @returns {number}
+ */
+function getPanelHp(baseHp, equipmentHp) {
+  return Math.min(baseHp + Math.max(0, equipmentHp), MAX_HP);
 }
 
 /**
@@ -1188,6 +1285,159 @@ function tryStaleHpWash(state, job, level, reserveMp, washTargetHp) {
 }
 
 /**
+ * 超过目标 3w 血等级仍未达标时，继续用新鲜 AP 洗血/扩蓝；蓝不足则等待自然涨蓝。
+ * @param {Object} args
+ * @param {SimState} args.state
+ * @param {JobId} args.job
+ * @param {number} args.level
+ * @param {number} args.reserveMp
+ * @param {import('../config/jobConfig.js').MwLevel} args.mwLevel
+ * @param {number} args.mwStartLevel
+ * @param {number} args.washTargetHp
+ * @param {number} args.targetInt
+ * @param {number} args.expandStartInt
+ * @param {boolean} args.noActiveMpExpand
+ * @param {Object} args.washPlan
+ * @param {boolean} args.hasGraduated
+ * @param {number} args.equipInt
+ * @returns {{ operation: string; segments: OperationSegment[]; warning: boolean; warningMessage: string; unusedAp: number }}
+ */
+function runExtendedWashAfterGoal({
+  state,
+  job,
+  level,
+  reserveMp,
+  mwLevel,
+  mwStartLevel,
+  washTargetHp,
+  targetInt,
+  expandStartInt,
+  noActiveMpExpand,
+  washPlan,
+  hasGraduated,
+  equipInt,
+}) {
+  if (isMagicianClass(job)) {
+    const [, nextMpMax] = getMpGrowthRange(
+      job,
+      Math.min(level + 1, MAX_GAME_LEVEL),
+    );
+    const nextNaturalHeadroom =
+      nextMpMax +
+      getLevelUpIntMpBonus(
+        state.int,
+        equipInt,
+        Math.min(level + 1, MAX_GAME_LEVEL),
+        mwLevel,
+        mwStartLevel,
+      ) +
+      getMagicBoostMpBonus(job, state.skills.magicBoost ?? 0);
+    const cycle = runMagicianMaxHpCycle(
+      state,
+      job,
+      level,
+      reserveMp,
+      washTargetHp,
+      FRESH_AP_PER_LEVEL,
+      equipInt,
+      nextNaturalHeadroom,
+    );
+    return {
+      operation: cycle.operation,
+      segments: cycle.operation
+        ? cycle.operation.split(' → ').map((text) => ({ text }))
+        : [{ text: '延后达标：本级蓝不足，等待自然涨蓝' }],
+      warning: cycle.warning,
+      warningMessage: cycle.warning
+        ? cycle.warningMessage || '延后达标洗血中断（蓝不足，等待自然涨蓝）'
+        : '',
+      unusedAp: cycle.unusedAp,
+    };
+  }
+
+  if (
+    job === 'buccaneer' ||
+    job === 'corsair' ||
+    isExpandThenWashJob(job) ||
+    (canUseExpandStartInt(job) && expandStartInt < targetInt)
+  ) {
+    const washResult =
+      job === 'buccaneer' || job === 'corsair'
+        ? runBuccaneerWashCycle(
+            state,
+            job,
+            level,
+            reserveMp,
+            mwLevel,
+            mwStartLevel,
+            washTargetHp,
+            targetInt,
+            FRESH_AP_PER_LEVEL,
+            noActiveMpExpand,
+            washPlan,
+          )
+        : runFreshHpWashWithMpFallback(
+            state,
+            job,
+            level,
+            reserveMp,
+            mwLevel,
+            mwStartLevel,
+            '延后达标洗血',
+            washTargetHp,
+            FRESH_AP_PER_LEVEL,
+            noActiveMpExpand,
+            targetInt,
+            washPlan,
+          );
+    if (washResult.warning && washResult.warningMessage) {
+      washResult.warningMessage = washResult.warningMessage.includes('自然')
+        ? washResult.warningMessage
+        : `${washResult.warningMessage}（可等待自然涨蓝后在后续等级继续）`;
+    }
+    return washResult;
+  }
+
+  if (hasGraduated) {
+    const washResult = runFreshHpWashWithMpFallback(
+      state,
+      job,
+      level,
+      reserveMp,
+      mwLevel,
+      mwStartLevel,
+      '延后达标洗血',
+      washTargetHp,
+      FRESH_AP_PER_LEVEL,
+      noActiveMpExpand,
+      targetInt,
+      washPlan,
+    );
+    if (washResult.warning && washResult.warningMessage) {
+      washResult.warningMessage = washResult.warningMessage.includes('自然')
+        ? washResult.warningMessage
+        : `${washResult.warningMessage}（可等待自然涨蓝后在后续等级继续）`;
+    }
+    return washResult;
+  }
+
+  return runFreshHpWashWithMpFallback(
+    state,
+    job,
+    level,
+    reserveMp,
+    mwLevel,
+    mwStartLevel,
+    '延后达标洗血',
+    washTargetHp,
+    FRESH_AP_PER_LEVEL,
+    noActiveMpExpand,
+    targetInt,
+    washPlan,
+  );
+}
+
+/**
  * 出山后智能洗血：每级仅用新鲜升级 AP（+HP → 退 MP 回主属性）。
  * 不靠一次性抽干库存蓝；蓝量靠「出山时库存 + 之后自然涨蓝」支撑到 3w 血目标等级。
  * @param {SimState} state
@@ -1297,8 +1547,9 @@ function formatFreshHpWashDetail(index, hit, enhancementLevel = 0) {
 }
 
 /**
- * 拳手/船长类：满生命强化后优先逐级智能洗血（+HP → 退 MP）。
- * 仅当推演「本级剩余 AP + 到 3w 血目标的新鲜洗血」会因蓝不够而无法达标时，才扩蓝补库存。
+ * 拳手/船长类：满生命强化后逐级智能洗血（+HP → 退 MP）。
+ * 拳手：未达目标 INT 时优先洗血，仅蓝不够才扩蓝；达目标 INT 后按规划提前为出山存蓝。
+ * 船长等：仍按「到洗血目标的新鲜洗血推演」决定是否规划扩蓝。
  * @param {SimState} state
  * @param {JobId} job
  * @param {number} level
@@ -1354,6 +1605,9 @@ function runBuccaneerWashCycle(
     washPlan?.graduationHpTarget ?? washTargetHp;
   const fullWashTargetHp =
     washPlan?.fullWashTargetHp ?? washTargetHp;
+  /** 拳手达目标 INT 后才规划性为出山存蓝；未达时仅蓝不够洗血才扩 */
+  const atTargetInt = state.int >= targetInt;
+  const allowProactiveExpand = job !== 'buccaneer' || atTargetInt;
 
   for (let i = 0; i < apCount; i += 1) {
     if (state.hp >= washTargetHp) {
@@ -1362,6 +1616,7 @@ function runBuccaneerWashCycle(
 
     const apLeftIncludingThis = apCount - usedAp;
     const preferExpand =
+      allowProactiveExpand &&
       !noActiveMpExpand &&
       goalLevel > level &&
       shouldExpandToMeetWashPlan({
@@ -1451,11 +1706,18 @@ function runBuccaneerWashCycle(
   if (skippedExpandForNatural) {
     segments.push({ text: '蓝不足，等待自然增长（不主动扩蓝）' });
   } else if (mpWashCount > 0) {
+    const expandLabel =
+      plannedExpandCount > 0
+        ? job === 'buccaneer' && atTargetInt
+          ? `为出山存蓝×${mpWashCount}`
+          : `规划扩蓝×${mpWashCount}`
+        : `蓝不足改扩蓝×${mpWashCount}`;
+    const expandSuffix =
+      plannedExpandCount > 0
+        ? `，补足到 Lv.${goalLevel} 洗血所需蓝`
+        : '';
     segments.push({
-      text:
-        plannedExpandCount > 0
-          ? `规划扩蓝×${mpWashCount} [${formatMpWashNet(totalNetMp)}，补足到 Lv.${goalLevel} 洗血所需蓝]`
-          : `蓝不足改扩蓝×${mpWashCount} [${formatMpWashNet(totalNetMp)}]`,
+      text: `${expandLabel} [${formatMpWashNet(totalNetMp)}${expandSuffix}]`,
       details: mpDetails,
     });
   } else if (hpWashCount === 0) {
@@ -1845,7 +2107,7 @@ function tryGraduateToMainStat(
   const detailParts = /** @type {string[]} */ ([]);
 
   for (const stat of otherStats) {
-    const floor = getStatFloor(job, stat);
+    const floor = getStatFloor(job, stat, level);
     const excess = state[stat] - floor;
     if (excess > 0) {
       state[stat] -= excess;
@@ -1913,7 +2175,7 @@ function resolveGraduationHpTarget(params, washTargetHp) {
 /**
  * 解析洗血目标等级与出山等级（兼容旧的单一 targetLevel）
  * @param {SimulationParams} params
- * @returns {{ hpGoalLevel: number; graduationTargetLevel: number; simEndLevel: number }}
+ * @returns {{ hpGoalLevel: number; graduationTargetLevel: number; washGoalLevel: number; simEndLevel: number }}
  */
 function resolveLevelGoals(params) {
   const hasLegacy =
@@ -1931,7 +2193,9 @@ function resolveLevelGoals(params) {
   return {
     hpGoalLevel,
     graduationTargetLevel,
-    simEndLevel: Math.max(hpGoalLevel, graduationTargetLevel),
+    washGoalLevel: hpGoalLevel,
+    /** 洗血优先止于 hpGoalLevel；未达标则延后至 200 级继续洗血/扩蓝 */
+    simEndLevel: MAX_GAME_LEVEL,
   };
 }
 
@@ -1945,11 +2209,11 @@ export function validateParams(params) {
   const { hpGoalLevel, graduationTargetLevel, simEndLevel } =
     resolveLevelGoals(params);
 
-  if (hpGoalLevel < 1 || hpGoalLevel > 200) {
-    errors.push('目标 3w 血等级需在 1 ~ 200 之间');
+  if (hpGoalLevel < 1 || hpGoalLevel > MAX_GAME_LEVEL) {
+    errors.push(`目标 3w 血等级需在 1 ~ ${MAX_GAME_LEVEL} 之间`);
   }
-  if (graduationTargetLevel < 1 || graduationTargetLevel > 200) {
-    errors.push('目标出山等级需在 1 ~ 200 之间');
+  if (graduationTargetLevel < 1 || graduationTargetLevel > MAX_GAME_LEVEL) {
+    errors.push(`目标出山等级需在 1 ~ ${MAX_GAME_LEVEL} 之间`);
   }
   const equipHp = getEquipmentHpBonus(
     params.hpEquipment ?? {
@@ -1977,6 +2241,31 @@ export function validateParams(params) {
   }
   if (params.mwLevel > 0 && params.mwStartLevel > simEndLevel) {
     errors.push('MW 生效等级不能大于模拟终点等级');
+  }
+
+  const startLevel = resolveStartLevel(params);
+  if (startLevel > 1) {
+    if (startLevel >= hpGoalLevel) {
+      errors.push('当前等级须低于目标 3w 血等级');
+    }
+    const shp = Number(params.startHp);
+    const smp = Number(params.startMp);
+    if (!Number.isFinite(shp) || shp < 1) {
+      errors.push('中途洗需填写有效的当前 HP');
+    }
+    if (!Number.isFinite(smp) || smp < 0) {
+      errors.push('中途洗需填写有效的当前 MP');
+    }
+    if (params.startSkills) {
+      const le = Number(params.startSkills.lifeEnhancement);
+      const mb = Number(params.startSkills.magicBoost ?? 0);
+      if (Number.isFinite(le) && (le < 0 || le > LIFE_ENHANCEMENT_MAX)) {
+        errors.push(`生命强化等级需在 0 ~ ${LIFE_ENHANCEMENT_MAX} 之间`);
+      }
+      if (Number.isFinite(mb) && (mb < 0 || mb > MAGIC_BOOST_MAX)) {
+        errors.push(`魔力强化等级需在 0 ~ ${MAGIC_BOOST_MAX} 之间`);
+      }
+    }
   }
 
   const statKeys = /** @type {const} */ (['str', 'dex', 'int', 'luk']);
@@ -2037,6 +2326,7 @@ function annotateWashSegments(washResult, leftover = '', note = '') {
  * @returns {LevelRecord}
  */
 function buildLevelRecord(input) {
+  const equipmentHp = Math.max(0, input.equipmentHp ?? 0);
   return {
     level: input.level,
     hpGain: input.hpGain,
@@ -2046,6 +2336,7 @@ function buildLevelRecord(input) {
     warning: input.warning,
     warningMessage: input.warningMessage,
     hp: input.state.hp,
+    panelHp: getPanelHp(input.state.hp, equipmentHp),
     mp: input.state.mp,
     str: input.state.str,
     dex: input.state.dex,
@@ -2056,6 +2347,7 @@ function buildLevelRecord(input) {
     minMp: input.minMp,
     totalApr: input.state.apr,
     totalNx: input.state.apr * APR_NX_COST,
+    naturalPreview: Boolean(input.naturalPreview),
   };
 }
 
@@ -2076,6 +2368,8 @@ export function runSimulation(params, options = {}) {
       equipmentHp: 0,
       washTargetHp: MAX_HP,
       finalMp: 0,
+      washGoalLevel: 180,
+      simEndLevel: MAX_GAME_LEVEL,
       projectedMpAt200: 0,
       optimalTargetInt: params.targetInt,
       finalStats: { ...params.baseStats },
@@ -2130,18 +2424,18 @@ export function runSimulation(params, options = {}) {
   const explicitGraduationHp = hasExplicitGraduationHpTarget(params);
   /** 出山前的阶段性洗血目标；出山后改为满血目标 */
   const preGradWashTarget = Math.min(washTargetHp, graduationHpTarget);
-  const initial = INITIAL_STATS[job];
+  const simStart = resolveSimulationStart(params, graduationTargetLevel);
 
   /** @type {SimState} */
   const state = {
-    hp: initial.hp,
-    mp: initial.mp,
+    hp: simStart.hp,
+    mp: simStart.mp,
     apr: 0,
     str: baseStats.str,
     dex: baseStats.dex,
     int: baseStats.int,
     luk: baseStats.luk,
-    skills: { lifeRecovery: 0, lifeEnhancement: 0, magicBoost: 0 },
+    skills: { ...simStart.skills },
   };
 
   /** @type {LevelRecord[]} */
@@ -2151,18 +2445,31 @@ export function runSimulation(params, options = {}) {
   /** @type {number | null} */
   let graduationHp = null;
   /** 出山后不再补 INT；血未满则继续用新鲜 AP 智能洗血 */
-  let hasGraduated = false;
+  let hasGraduated = simStart.hasGraduated;
 
   if (!lite) {
+    const startOp =
+      simStart.startLevel <= 1
+        ? `初始状态 STR${state.str} DEX${state.dex} INT${state.int} LUK${state.luk}`
+        : `中途起点 Lv.${simStart.startLevel} · HP ${simStart.hp} MP ${simStart.mp} · STR${state.str} DEX${state.dex} INT${state.int} LUK${state.luk}${
+            state.skills.lifeEnhancement > 0
+              ? ` · 生命强化 Lv.${state.skills.lifeEnhancement}`
+              : ''
+          }${
+            (state.skills.magicBoost ?? 0) > 0
+              ? ` · 魔力强化 Lv.${state.skills.magicBoost}`
+              : ''
+          }${hasGraduated ? ' · 已出山' : ''}`;
     records.push(
       buildLevelRecord({
-        level: 1,
+        level: simStart.startLevel,
         hpGain: 0,
         mpGain: 0,
-        operation: `初始状态 STR${state.str} DEX${state.dex} INT${state.int} LUK${state.luk}`,
+        operation: startOp,
         warning: false,
         state,
-        minMp: getMinMp(job, 1),
+        equipmentHp,
+        minMp: getMinMp(job, simStart.startLevel),
       }),
     );
   }
@@ -2170,10 +2477,21 @@ export function runSimulation(params, options = {}) {
   let hasWarning = false;
   let peakMp = state.mp;
   /** @type {number | null} */
-  let mpCapLevel = state.mp >= MAX_MP ? 1 : null;
+  let mpCapLevel =
+    state.mp >= MAX_MP ? simStart.startLevel : null;
   /** 法师：峰值蓝达到 3 万后进入持续洗血阶段 */
   let mageWashPhase = state.mp >= MAX_MP;
-  for (let level = 2; level <= targetLevel; level += 1) {
+  const loopFrom = simStart.startLevel + 1;
+  for (let level = loopFrom; level <= targetLevel; level += 1) {
+    if (level === SECOND_JOB_LEVEL) {
+      const adv = checkSecondJobAdvancement(state, job);
+      if (!adv.ok) {
+        hasWarning = true;
+        warningMessage = adv.message ?? '30级转职失败';
+        break;
+      }
+    }
+
     // 先分配当级 SP，使生命强化/魔力强化当级生效（与预估路径一致）
     const spResult = allocateSkillPoints(state.skills, job, level);
     state.skills = spResult.skills;
@@ -2188,7 +2506,7 @@ export function runSimulation(params, options = {}) {
     );
     const baseHpGain = randomInt(hpMin, hpMax);
     const rawHpGain = baseHpGain + skillBonusForGrowth;
-    const hpGain = capHpGain(state.hp, rawHpGain, washTargetHp);
+    const hpGain = capNaturalHpGain(state.hp, rawHpGain);
     const equipInt = getEquipIntAtLevel(equipIntBonuses, level);
     const intMpBonus = getLevelUpIntMpBonus(
       state.int,
@@ -2283,35 +2601,26 @@ export function runSimulation(params, options = {}) {
     };
 
     /**
-     * 本级洗血目标：出山前冲出山血量，出山后冲满血
+     * 本级洗血目标：出山前冲出山血量，出山后冲满血（含装备时已扣减为基础 HP 目标）
      */
     const stageWashTarget = hasGraduated ? washTargetHp : preGradWashTarget;
-
-    /**
-     * 洗血规划上下文：用「自然成长 + 每级新鲜 AP 洗血 + 蓝量收支」判断扩蓝与否
-     */
-    const washPlan = {
-      washGoalLevel,
-      equipIntBonuses,
-      graduationLevel: graduationTargetLevel,
-      graduationInt: getStatFloor(job, 'int'),
-      graduationHpTarget: preGradWashTarget,
-      /** 满血目标（出山后的最终洗血目标） */
-      fullWashTargetHp: washTargetHp,
-    };
+    const washTargetReached = state.hp >= washTargetHp;
+    const isBeyondWashGoal = level > washGoalLevel;
 
     /**
      * 仅靠自然成长是否已够本阶段目标（可停洗省 NX）
+     * 出山后：未达目标等级时看到目标等级；已达/超过目标等级时看到 200 级。
      * @returns {boolean}
      */
     const canStopWashingByNatural = () => {
       if (hasGraduated) {
+        const naturalEndLevel =
+          level >= washGoalLevel ? simEndLevel : washGoalLevel;
         return (
-          level < washGoalLevel &&
           estimateNaturalHpToGoal(
             state.hp,
             level,
-            washGoalLevel,
+            naturalEndLevel,
             job,
             state.skills,
             washTargetHp,
@@ -2331,8 +2640,91 @@ export function runSimulation(params, options = {}) {
       );
     };
 
-    if (hasGraduated) {
-      if (canStopWashingByNatural() || state.hp >= washTargetHp) {
+    const willReachWashTargetNaturally = canStopWashingByNatural();
+    /** 有装备且已达/超过目标等级：面板 3w 靠自然成长即可，不再花 NX 洗血 */
+    const stopPaidWashAfterGoal =
+      equipmentHp > 0 && level >= washGoalLevel;
+    /** 已达目标、自然成长足够、或有装备且已过目标等级：仅自然预览 */
+    const isNaturalPreview =
+      isBeyondWashGoal &&
+      (washTargetReached ||
+        willReachWashTargetNaturally ||
+        equipmentHp > 0);
+    /** 无装备时才在超过目标等级后延后洗血；有装备时交给自然成长 */
+    const isExtendedWash =
+      equipmentHp === 0 &&
+      isBeyondWashGoal &&
+      !washTargetReached &&
+      !willReachWashTargetNaturally;
+
+    /**
+     * 洗血规划上下文：用「自然成长 + 每级新鲜 AP 洗血 + 蓝量收支」判断扩蓝与否
+     */
+    const washPlan = {
+      washGoalLevel: isExtendedWash ? simEndLevel : washGoalLevel,
+      equipIntBonuses,
+      graduationLevel: graduationTargetLevel,
+      graduationInt: getStatFloor(job, 'int'),
+      graduationHpTarget: preGradWashTarget,
+      /** 满血目标（出山后的最终洗血目标） */
+      fullWashTargetHp: washTargetHp,
+    };
+
+    /**
+     * @param {number} endLevel
+     * @returns {string}
+     */
+    const formatNaturalWashStopHint = (endLevel) => {
+      if (equipmentHp > 0) {
+        return `装备加成下预计 Lv.${endLevel} 自然成长可达面板 ${MAX_HP.toLocaleString('zh-CN')} HP（基础 ${washTargetHp.toLocaleString('zh-CN')}）`;
+      }
+      return `预计 Lv.${endLevel} 自然成长可达洗血目标 ${washTargetHp.toLocaleString('zh-CN')} HP`;
+    };
+
+    if (isNaturalPreview) {
+      const allocated = allocateLevelUpAp(
+        state,
+        job,
+        targetInt,
+        FRESH_AP_PER_LEVEL,
+        true,
+      );
+      pushPlain(
+        washTargetReached
+          ? `自然成长预览 (${formatApAllocation(allocated)}，AP 全加主属性，不计洗血)`
+          : `自然成长预览 (${formatApAllocation(allocated)}，${formatNaturalWashStopHint(simEndLevel)}，AP 全加主属性不计洗血 NX)`,
+      );
+    } else if (isExtendedWash) {
+      const washResult = runExtendedWashAfterGoal({
+        state,
+        job,
+        level,
+        reserveMp,
+        mwLevel,
+        mwStartLevel,
+        washTargetHp,
+        targetInt,
+        expandStartInt,
+        noActiveMpExpand,
+        washPlan,
+        hasGraduated,
+        equipInt,
+      });
+      if (washResult.warning) {
+        warning = true;
+        hasWarning = true;
+        warningMessage = washResult.warningMessage;
+      }
+      const leftover = dumpFreshApToMain(state, job, washResult.unusedAp);
+      pushSegments(
+        annotateWashSegments(washResult, leftover, '（超过目标等级延后达标）'),
+      );
+    } else if (hasGraduated) {
+      if (
+        willReachWashTargetNaturally ||
+        washTargetReached ||
+        stopPaidWashAfterGoal
+      ) {
         const allocated = allocateLevelUpAp(
           state,
           job,
@@ -2340,10 +2732,14 @@ export function runSimulation(params, options = {}) {
           FRESH_AP_PER_LEVEL,
           true,
         );
+        const naturalEndLevel =
+          level >= washGoalLevel ? simEndLevel : washGoalLevel;
         pushPlain(
-          state.hp >= washTargetHp
-            ? `出山后正常升级 (${formatApAllocation(allocated)}，AP 全加主属性)`
-            : `出山后节约NX：预计 Lv.${washGoalLevel} 自然成长可达洗血目标，本级 AP 全加主属性 (${formatApAllocation(allocated)})`,
+          washTargetReached
+            ? `出山后正常升级 (${formatApAllocation(allocated)}，AP 全加主属性${equipmentHp > 0 ? '，面板 HP 已达标' : ''})`
+            : stopPaidWashAfterGoal
+              ? `出山后节约NX：${equipmentHp > 0 ? `已过 Lv.${washGoalLevel}，装备加成下靠自然成长追面板 ${MAX_HP.toLocaleString('zh-CN')} HP` : formatNaturalWashStopHint(naturalEndLevel)}，本级 AP 全加主属性 (${formatApAllocation(allocated)})`
+              : `出山后节约NX：${formatNaturalWashStopHint(naturalEndLevel)}，本级 AP 全加主属性 (${formatApAllocation(allocated)})`,
         );
       } else {
         // 出山后：每级只用新鲜 AP 智能洗血（不抽干库存蓝）
@@ -2663,7 +3059,7 @@ export function runSimulation(params, options = {}) {
         pushSegments(stepSegments);
       }
     } else if (job === 'buccaneer') {
-      // 拳手：满生命强化后逐渐智能洗血；蓝不够时按「到 3w 目标的新鲜洗血+自然涨蓝」规划扩蓝
+      // 拳手：满生命强化后优先洗血；未达目标 INT 时蓝不够才扩，达目标 INT 后为出山存蓝
       const lifeMaxed =
         state.skills.lifeEnhancement >= LIFE_ENHANCEMENT_MAX;
       const shouldSaveNx = canStopWashingByNatural();
@@ -2955,13 +3351,15 @@ export function runSimulation(params, options = {}) {
           warning,
           warningMessage: warning ? warningMessage : undefined,
           state,
+          equipmentHp,
           minMp: Math.max(getMinMp(job, level), reserveMp),
+          naturalPreview: isNaturalPreview,
         }),
       );
     }
   }
 
-  const finalBaseHp = Math.min(state.hp, washTargetHp);
+  const finalBaseHp = Math.min(state.hp, MAX_HP);
   const projectedMpAt200 = projectMaxMpAt200(
     state.mp,
     targetLevel,
@@ -2974,11 +3372,13 @@ export function runSimulation(params, options = {}) {
   );
   return {
     records,
-    finalHp: finalBaseHp + equipmentHp,
+    finalHp: getPanelHp(state.hp, equipmentHp),
     finalBaseHp,
     equipmentHp,
     washTargetHp,
     finalMp: state.mp,
+    washGoalLevel,
+    simEndLevel: targetLevel,
     projectedMpAt200,
     optimalTargetInt: targetInt,
     finalStats: {
@@ -3012,6 +3412,94 @@ function yieldToUi() {
 }
 
 /**
+ * 解析用户偏好的目标 INT（未填则回落到职业默认）
+ * @param {Omit<SimulationParams, 'targetInt' | 'reserveMp'>} params
+ * @param {number} baseInt
+ * @param {number} maxAvailableInt
+ * @returns {number | null} 法师返回 null
+ */
+function resolvePreferredTargetInt(params, baseInt, maxAvailableInt) {
+  if (isDefaultAllIntStrategy(params.job)) {
+    return null;
+  }
+  const raw = Number(params.preferredTargetInt);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.max(baseInt, Math.min(maxAvailableInt, Math.floor(raw)));
+  }
+  const fallback = getDefaultTargetInt(params.job) ?? baseInt;
+  return Math.max(baseInt, Math.min(maxAvailableInt, fallback));
+}
+
+/**
+ * 解析用户偏好的扩蓝启动 INT
+ * @param {Omit<SimulationParams, 'targetInt' | 'reserveMp'>} params
+ * @param {number} targetInt
+ * @param {number} baseInt
+ * @returns {number}
+ */
+function resolvePreferredExpandStartInt(params, targetInt, baseInt) {
+  const minExpand = getMinProfitableExpandInt();
+  const raw = Number(params.preferredExpandStartInt);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.max(
+      baseInt,
+      minExpand,
+      Math.min(targetInt, Math.floor(raw)),
+    );
+  }
+  const fallback =
+    getDefaultExpandStartInt(params.job) ?? targetInt;
+  return Math.max(
+    baseInt,
+    minExpand,
+    Math.min(targetInt, fallback),
+  );
+}
+
+/**
+ * 按固定目标 INT（及扩蓝启动 INT）直接模拟，不智能寻优
+ * @param {Omit<SimulationParams, 'reserveMp'> & { targetInt: number }} params
+ * @param {number | null | undefined} targetMpAt200
+ * @param {(progress: { percent: number; message: string }) => void} [onProgress]
+ * @returns {Promise<SimulationResult>}
+ */
+export async function runFixedTargetInt(params, targetMpAt200, onProgress) {
+  const hasMpTarget =
+    typeof targetMpAt200 === 'number' &&
+    Number.isFinite(targetMpAt200) &&
+    targetMpAt200 > 0;
+
+  onProgress?.({ percent: 15, message: '按设定 INT 模拟…' });
+  await yieldToUi();
+
+  const result = runSimulation({
+    ...params,
+    reserveMp: 0,
+  });
+
+  onProgress?.({ percent: 100, message: '完成' });
+
+  const needsExpand =
+    isExpandThenWashJob(params.job) ||
+    (hasMpTarget && canUseExpandStartInt(params.job)) ||
+    canUseExpandStartInt(params.job);
+
+  return {
+    ...result,
+    optimalTargetInt: params.targetInt,
+    optimalExpandStartInt: needsExpand
+      ? (params.expandStartInt ?? params.targetInt)
+      : undefined,
+    defaultTargetInt: isDefaultAllIntStrategy(params.job)
+      ? null
+      : params.targetInt,
+    defaultAllInt: isDefaultAllIntStrategy(params.job),
+    optimizationTargetMp: hasMpTarget ? targetMpAt200 : null,
+    optimizationFeasible: result.graduationLevel !== null,
+  };
+}
+
+/**
  * 按步长生成 INT 候选（始终包含两端）
  * @param {number} minInt
  * @param {number} maxInt
@@ -3041,10 +3529,11 @@ function buildIntCandidates(minInt, maxInt, step) {
  */
 export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
   const baseInt = params.baseStats.int;
-  const { simEndLevel } = resolveLevelGoals(params);
+  const startLevel = resolveStartLevel(params);
+  const { washGoalLevel, simEndLevel } = resolveLevelGoals(params);
   const maxAvailableInt = Math.min(
     999,
-    baseInt + FRESH_AP_PER_LEVEL * Math.max(0, simEndLevel - 1),
+    baseInt + FRESH_AP_PER_LEVEL * Math.max(0, washGoalLevel - startLevel),
   );
   const hasMpTarget =
     typeof targetMpAt200 === 'number' &&
@@ -3058,6 +3547,19 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
   const minExpandInt = getMinProfitableExpandInt();
   /** 法师扩蓝净收益转正：18+⌊INT/10⌋−30 > 0 → INT≥130（仅基础 INT） */
   const magicianExpandStartInt = Math.max(baseInt, 130);
+  const preferredTargetInt = resolvePreferredTargetInt(
+    params,
+    baseInt,
+    maxAvailableInt,
+  );
+  const preferredExpandStartInt =
+    typeof preferredTargetInt === 'number'
+      ? resolvePreferredExpandStartInt(
+          params,
+          preferredTargetInt,
+          baseInt,
+        )
+      : magicianExpandStartInt;
 
   let bestTargetInt = null;
   let bestExpandStartInt = null;
@@ -3149,6 +3651,7 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
       Math.min(hi, worthwhileMin),
       Math.min(hi, 300),
       hi,
+      Math.max(lo, Math.min(hi, preferredExpandStartInt)),
     ]);
 
     if (hasMpTarget) {
@@ -3230,7 +3733,8 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
 
         const planComplete = isMage
           ? (result.peakMp ?? 0) >= MAX_MP && result.graduationLevel !== null
-          : result.finalHp >= MAX_HP && result.graduationLevel !== null;
+          : result.finalBaseHp >= result.washTargetHp &&
+            result.graduationLevel !== null;
 
         if (planComplete) {
           completeTrials += 1;
@@ -3392,9 +3896,8 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
   } else {
     /** @type {Set<number>} */
     const coarseSet = new Set(buildIntCandidates(baseInt, maxAvailableInt, 10));
-    const defaultInt = getDefaultTargetInt(params.job);
-    if (typeof defaultInt === 'number') {
-      coarseSet.add(Math.max(baseInt, Math.min(maxAvailableInt, defaultInt)));
+    if (typeof preferredTargetInt === 'number') {
+      coarseSet.add(preferredTargetInt);
     }
     const coarse = [...coarseSet].sort((a, b) => a - b);
     await evaluatePairs(
@@ -3427,8 +3930,8 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
         4,
       ),
     );
-    if (typeof defaultInt === 'number') {
-      fineSet.add(Math.max(baseInt, Math.min(maxAvailableInt, defaultInt)));
+    if (typeof preferredTargetInt === 'number') {
+      fineSet.add(preferredTargetInt);
     }
     const fine = [...fineSet].sort((a, b) => a - b);
     await evaluatePairs(
@@ -3534,7 +4037,7 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
         : (hasMpTarget &&
             selectedResult.projectedMpAt200 <
               /** @type {number} */ (targetMpAt200)) ||
-          selectedResult.finalHp < MAX_HP ||
+          selectedResult.finalBaseHp < selectedResult.washTargetHp ||
           selectedResult.graduationLevel === null
     );
     retry += 1
@@ -3550,9 +4053,9 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
   const defaultAllInt = isDefaultAllIntStrategy(params.job);
   const defaultTargetInt = defaultAllInt
     ? null
-    : (getDefaultTargetInt(params.job) ?? baseInt);
+    : (preferredTargetInt ?? baseInt);
 
-  report(96, '生成默认 INT 对照方案…');
+  report(96, '生成设定 INT 对照方案…');
   await yieldToUi();
 
   const defaultPlan = defaultAllInt
@@ -3561,13 +4064,7 @@ export async function optimizeTargetInt(params, targetMpAt200, onProgress) {
         ...params,
         targetInt: /** @type {number} */ (defaultTargetInt),
         expandStartInt: needsExpandStartSearch
-          ? Math.max(
-              minExpandInt,
-              Math.min(
-                /** @type {number} */ (defaultTargetInt),
-                selectedExpandStartInt,
-              ),
-            )
+          ? preferredExpandStartInt
           : /** @type {number} */ (defaultTargetInt),
         reserveMp: 0,
       });
