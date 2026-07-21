@@ -8,8 +8,10 @@ import {
   MAX_HP,
   MAX_MP,
   MW_OPTIONS,
+  APR_NX_COST,
   isDefaultAllIntStrategy,
   isExpandThenWashJob,
+  canUseExpandStartInt,
 } from './config/jobConfig.js';
 import { optimizeTargetInt } from './utils/simulation.js';
 
@@ -89,11 +91,14 @@ function HoverDetail({ text, details }) {
       {text}
       {open ? (
         <span
-          className="pointer-events-none fixed z-50 max-w-xs rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-[11px] leading-5 text-neutral-700 shadow-lg"
+          className="pointer-events-none fixed z-50 max-w-md rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-[11px] leading-5 text-neutral-700 shadow-lg"
           style={{ left: pos.x, top: pos.y }}
         >
           <span className="mb-1 block font-semibold text-neutral-900">
             逐次明细
+          </span>
+          <span className="mb-1.5 block text-[10px] leading-4 text-neutral-500">
+            物理扩蓝净蓝 = ⌊基础INT/10⌋−2（−2 为公式常数；退点为职业固定扣蓝）
           </span>
           {details.map((line) => (
             <span key={line} className="block tabular-nums">
@@ -168,7 +173,9 @@ export default function App() {
     /** @type {{ id: string; level: string; int: string }[]} */ ([]),
   );
   const [noActiveMpExpand, setNoActiveMpExpand] = useState(false);
-  const [targetLevel, setTargetLevel] = useState(135);
+  const [hpGoalLevel, setHpGoalLevel] = useState(180);
+  const [graduationTargetLevel, setGraduationTargetLevel] = useState(160);
+  const [graduationHpTarget, setGraduationHpTarget] = useState('');
   const [targetMpAt200, setTargetMpAt200] = useState('');
   const [mwStartLevel, setMwStartLevel] = useState(10);
   /** @type {[import('./config/jobConfig.js').MwLevel, React.Dispatch<React.SetStateAction<import('./config/jobConfig.js').MwLevel>>]} */
@@ -217,6 +224,9 @@ export default function App() {
       const rawTargetMp = String(targetMpAt200).trim();
       const parsedTargetMp =
         rawTargetMp === '' ? null : Number(rawTargetMp);
+      const rawGradHp = String(graduationHpTarget).trim();
+      const parsedGradHp =
+        rawGradHp === '' ? undefined : Number(rawGradHp);
       const simulationResult = await optimizeTargetInt(
         {
           job,
@@ -238,7 +248,9 @@ export default function App() {
                 Number.isFinite(row.int) &&
                 row.int > 0,
             ),
-          targetLevel: Number(targetLevel),
+          hpGoalLevel: Number(hpGoalLevel),
+          graduationTargetLevel: Number(graduationTargetLevel),
+          graduationHpTarget: parsedGradHp,
           mwStartLevel: Number(mwStartLevel),
           mwLevel: /** @type {import('./config/jobConfig.js').MwLevel} */ (
             Number(mwLevel)
@@ -278,7 +290,7 @@ export default function App() {
             </p>
           </div>
           <span className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 text-xs font-medium text-neutral-600">
-            APR = 3,500 NX
+            APR = {APR_NX_COST.toLocaleString('zh-CN')} NX
           </span>
         </div>
       </header>
@@ -453,16 +465,43 @@ export default function App() {
             <h2 className="mb-3 text-sm font-semibold text-neutral-900">全局设定</h2>
             <div className="space-y-3">
               <FormField
-                label="目标等级"
-                hint="同时作为模拟终点和洗血目标；若预计仅靠自然成长即可达到洗血目标 HP，则提前出山"
+                label="目标 3w 血等级"
+                hint="尽量在此等级前洗满目标 HP。系统按：当前血+自然成长+每级新鲜AP洗血，以及出山时蓝+之后自然涨蓝，判断是否够洗到 3w"
               >
                 <input
                   className={inputClassName}
                   type="number"
                   min={1}
                   max={200}
-                  value={targetLevel}
-                  onChange={(e) => setTargetLevel(e.target.value)}
+                  value={hpGoalLevel}
+                  onChange={(e) => setHpGoalLevel(e.target.value)}
+                />
+              </FormField>
+              <FormField
+                label="目标出山等级"
+                hint="此等级把智力洗回主属性恢复战力；可低于 3w 血目标。出山前先洗到「出山目标血量」，出山后再冲满血"
+              >
+                <input
+                  className={inputClassName}
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={graduationTargetLevel}
+                  onChange={(e) => setGraduationTargetLevel(e.target.value)}
+                />
+              </FormField>
+              <FormField
+                label="出山目标血量"
+                hint="可留空：不单独设出山血量，出山前按正常洗血目标推进；填写后出山前先洗到该血量，出山后再冲满血（3w − 装备）"
+              >
+                <input
+                  className={inputClassName}
+                  type="number"
+                  min={1}
+                  max={30000}
+                  placeholder="不设则按正常目标"
+                  value={graduationHpTarget}
+                  onChange={(e) => setGraduationHpTarget(e.target.value)}
                 />
               </FormField>
               <FormField
@@ -470,7 +509,7 @@ export default function App() {
                 hint={
                   job === 'magician'
                     ? '法师不计 NX：前期 AP 全加 INT；净收益转正后扩蓝。近 3 万蓝时只洗到不亏损极限（给自然成长/扩蓝留空间），绝不一次洗到最低蓝'
-                    : '可留空：不强制目标蓝，按默认推演结果；填写后系统寻找满足该 MP 且总 NX 最低的面板 INT'
+                    : '可留空：不强制目标蓝，按默认推演结果；填写后系统优先提前扩蓝以满足目标 MP，并在够蓝方案中选 NX 较低者'
                 }
               >
                 <input
@@ -651,11 +690,36 @@ export default function App() {
                     : result;
                 const defaultInt =
                   result.defaultTargetInt ?? getDefaultTargetInt(job);
+                const showExpandStart =
+                  isExpandThenWashJob(job) ||
+                  (canUseExpandStartInt(job) &&
+                    result.optimalExpandStartInt != null);
                 return (
             <>
               {activePlan.hasWarning ? (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                  模拟过程中出现 MP 触底警告，部分等级的洗点/扩蓝操作已中断。
+                  {(() => {
+                    const messages = [
+                      ...new Set(
+                        (activePlan.records ?? [])
+                          .filter((row) => row.warning && row.warningMessage)
+                          .map((row) => row.warningMessage),
+                      ),
+                    ];
+                    if (messages.length === 0) {
+                      return '模拟过程中出现警告，请查看标 ⚠ 的等级（悬停可看原因）。';
+                    }
+                    return (
+                      <>
+                        模拟过程中出现警告：
+                        <ul className="mt-1 list-disc pl-5">
+                          {messages.map((msg) => (
+                            <li key={msg}>{msg}</li>
+                          ))}
+                        </ul>
+                      </>
+                    );
+                  })()}
                 </div>
               ) : null}
               {planView === 'optimal' && result.optimizationFeasible === false ? (
@@ -680,7 +744,7 @@ export default function App() {
                             ? `按职业默认 INT ${defaultInt} 推演`
                             : String(targetMpAt200).trim() === ''
                               ? '未设目标蓝：按洗血完成且 NX 最低规划，蓝量有多少算多少'
-                              : '系统已按目标 MP 与最低 NX 开销完成路径规划'}
+                              : '已设目标蓝：优先提前扩蓝以满足 MP，再兼顾最低 NX'}
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -720,7 +784,7 @@ export default function App() {
 
                   <div
                     className={`grid gap-6 sm:grid-cols-2 ${
-                      isExpandThenWashJob(job)
+                      showExpandStart
                         ? 'xl:grid-cols-6'
                         : 'xl:grid-cols-5'
                     }`}
@@ -763,7 +827,7 @@ export default function App() {
                           : '满足目标时 NX 最低'
                       }
                     />
-                    {isExpandThenWashJob(job) ? (
+                    {showExpandStart ? (
                       <SummaryMetric
                         label="扩蓝启动 INT"
                         value={
@@ -771,7 +835,11 @@ export default function App() {
                           result.optimalTargetInt
                         }
                         emphasized
-                        subtitle="平衡扩蓝收益与 NX，启动后边扩蓝边洗血"
+                        subtitle={
+                          String(targetMpAt200).trim() === ''
+                            ? '平衡扩蓝收益与 NX，启动后边扩蓝边洗血'
+                            : '目标蓝模式下偏向提前扩蓝以多攒蓝'
+                        }
                       />
                     ) : null}
                     <SummaryMetric
@@ -788,7 +856,7 @@ export default function App() {
                       label="总 NX 开销"
                       value={formatNumber(activePlan.totalNx)}
                       emphasized
-                      subtitle={`${formatNumber(activePlan.totalApr)} 张 APR × 3,500`}
+                      subtitle={`${formatNumber(activePlan.totalApr)} 张 APR × ${formatNumber(APR_NX_COST)}`}
                     />
                   </div>
                 </div>
@@ -796,7 +864,7 @@ export default function App() {
                 <div className="grid grid-cols-2 divide-x divide-y divide-neutral-100 sm:grid-cols-4 xl:grid-cols-8">
                   <div className="p-4">
                     <SummaryMetric
-                      label={`Lv.${targetLevel} MP`}
+                      label={`Lv.${Math.max(Number(hpGoalLevel) || 0, Number(graduationTargetLevel) || 0)} MP`}
                       value={formatNumber(activePlan.finalMp)}
                     />
                   </div>
@@ -816,6 +884,15 @@ export default function App() {
                     <SummaryMetric
                       label="出山等级"
                       value={activePlan.graduationLevel ? `Lv.${activePlan.graduationLevel}` : '—'}
+                      subtitle={
+                        activePlan.graduationHp != null
+                          ? `当时 HP ${formatNumber(activePlan.graduationHp)}${
+                              activePlan.graduationHpTarget
+                                ? ` / 目标 ${formatNumber(activePlan.graduationHpTarget)}`
+                                : ''
+                            }`
+                          : undefined
+                      }
                     />
                   </div>
                   <div className="p-4">
@@ -974,8 +1051,7 @@ export default function App() {
                 配置参数后开始模拟
               </h2>
               <p className="mt-2 max-w-md text-sm text-neutral-500">
-                设置目标等级后点击「开始模拟」。200 级目标 MP 可留空。系统会自动选择最优
-                INT，并智能决定何时洗血、扩蓝与出山。
+                设置目标 3w 血等级、出山等级与出山血量后点击「开始模拟」。系统会先洗到出山血量再出山，之后继续洗到满血。
               </p>
             </div>
           )}

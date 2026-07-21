@@ -18,7 +18,7 @@ export const JOB_OPTIONS = {
 };
 
 /** 每张洗点卡(APR)消耗 NX */
-export const APR_NX_COST = 3500;
+export const APR_NX_COST = 3100;
 
 /** 洗血模拟角色基础 HP 上限（不含装备） */
 export const MAX_HP = 30000;
@@ -116,7 +116,7 @@ export function getDefaultTargetInt(job) {
 }
 
 /**
- * 各职业升级 AP 分配优先级
+ * 各职业升级 AP 分配优先级（一转前置属性出山后仍保留，不可再洗到更低）
  * @type {Record<JobId, { prereqStat: StatKey | null; prereqTarget: number }>}
  */
 export const AP_ALLOCATION_RULES = {
@@ -128,6 +128,20 @@ export const AP_ALLOCATION_RULES = {
   archer: { prereqStat: 'dex', prereqTarget: 25 },
   thief: { prereqStat: 'dex', prereqTarget: 25 },
 };
+
+/**
+ * 单项属性下限：绝对最低 MIN_STAT；一转要求的前置属性不可洗到更低
+ * @param {JobId} job
+ * @param {StatKey} stat
+ * @returns {number}
+ */
+export function getStatFloor(job, stat) {
+  const rule = AP_ALLOCATION_RULES[job];
+  if (rule?.prereqStat === stat && rule.prereqTarget > MIN_STAT) {
+    return rule.prereqTarget;
+  }
+  return MIN_STAT;
+}
 
 /** 通用 1 级默认四属性（全职业：STR/DEX/LUK 5，INT 10） */
 export const DEFAULT_BASE_STATS = { str: 5, dex: 5, int: 10, luk: 5 };
@@ -183,7 +197,21 @@ export function isExpandThenWashJob(job) {
 }
 
 /**
+ * 支持「扩蓝启动 INT」路径的职业（含战士：设目标蓝时可提前扩蓝）
+ * @param {JobId} job
+ * @returns {boolean}
+ */
+export function canUseExpandStartInt(job) {
+  return (
+    isExpandThenWashJob(job) ||
+    job === 'warriorHero' ||
+    job === 'warriorPaladin'
+  );
+}
+
+/**
  * 物理职业扩蓝净收益转正的最低基础 INT（floor(INT/10)-2 ≥ 1 → INT≥30）
+ * 公式中的 −2 是净蓝常数，不是「退点扣蓝」（海盗退点仍为 16 等）
  * @returns {number}
  */
 export function getMinProfitableExpandInt() {
@@ -191,19 +219,60 @@ export function getMinProfitableExpandInt() {
 }
 
 /**
- * 各职业 1 级初始 HP/MP（模拟起点）
+ * 一转等级：此前按新手（Beginner）成长 / Min MP / 洗血
+ * 怀旧服探索者一般为 Lv.8 一转
+ */
+export const FIRST_JOB_LEVEL = 8;
+
+/**
+ * 新手自然升级 HP（MapleJob.BEGINNER）
+ * @type {[number, number]}
+ */
+export const BEGINNER_HP_GROWTH_RANGE = [12, 16];
+
+/**
+ * 新手自然升级 MP（MapleJob.BEGINNER，不含 INT 加成）
+ * @type {[number, number]}
+ */
+export const BEGINNER_MP_GROWTH_RANGE = [10, 12];
+
+/** 新手洗血固定 +HP */
+export const BEGINNER_FRESH_HP_WASH = 8;
+
+/** 新手洗血 / 退点固定 -MP */
+export const BEGINNER_APR_MP_DEDUCTION = 8;
+
+/**
+ * 当前等级是否仍按新手公式（一转当级及以前；一转后从下一等级起用职业公式）
+ * @param {number} level
+ * @returns {boolean}
+ */
+export function isBeginnerLevel(level) {
+  return level <= FIRST_JOB_LEVEL;
+}
+
+/**
+ * 新手 Min MP = 10×等级 − 5
+ * @param {number} level
+ * @returns {number}
+ */
+export function getBeginnerMinMp(level) {
+  return 10 * level - 5;
+}
+
+/**
+ * 各职业 1 级初始 HP/MP（模拟起点：尚未转职，按新手）
  * @type {Record<JobId, { hp: number; mp: number }>}
  */
 export const INITIAL_STATS = {
-  // 二转后 Min MP：英雄 4L+55，圣骑/黑骑 4L+155；1 级起点对齐底线
-  warriorHero: { hp: 50, mp: 59 },
-  warriorPaladin: { hp: 50, mp: 159 },
-  // 法师二转后 Min MP = 22L+449，1 级起点至少满足底线
-  magician: { hp: 50, mp: 471 },
-  buccaneer: { hp: 50, mp: 18 },
-  corsair: { hp: 50, mp: 18 },
-  archer: { hp: 50, mp: 14 },
-  thief: { hp: 50, mp: 14 },
+  // Lv.1 新手 Min MP = 10×1−5 = 5
+  warriorHero: { hp: 50, mp: 5 },
+  warriorPaladin: { hp: 50, mp: 5 },
+  magician: { hp: 50, mp: 5 },
+  buccaneer: { hp: 50, mp: 5 },
+  corsair: { hp: 50, mp: 5 },
+  archer: { hp: 50, mp: 5 },
+  thief: { hp: 50, mp: 5 },
 };
 
 /**
@@ -276,20 +345,19 @@ export const STALE_HP_WASH_GAIN = {
 
 /**
  * 获取指定等级升级时的 HP 基础自然增长区间（不含生命强化额外加成）
+ * 一转前统一新手 12~16；一转后按职业
  * @param {JobId} job
  * @param {number} level 升级后的目标等级
  * @returns {[number, number]}
  */
 export function getHpGrowthRange(job, level) {
-  if (job === 'magician') {
-    return [10, 14];
-  }
-
-  if (level <= 10) {
-    return [12, 16];
+  if (isBeginnerLevel(level)) {
+    return BEGINNER_HP_GROWTH_RANGE;
   }
 
   switch (job) {
+    case 'magician':
+      return [10, 14];
     case 'warriorHero':
     case 'warriorPaladin':
       // 满级生命强化后合计 64~68：基础 24~28 + 强化 +40
@@ -303,16 +371,21 @@ export function getHpGrowthRange(job, level) {
     case 'thief':
       return [20, 24];
     default:
-      return [12, 16];
+      return BEGINNER_HP_GROWTH_RANGE;
   }
 }
 
 /**
  * 获取 MP 自然增长区间（不含智力/技能加成）
+ * 一转前统一新手 10~12；一转后按职业
  * @param {JobId} job
+ * @param {number} [level=99]
  * @returns {[number, number]}
  */
-export function getMpGrowthRange(job) {
+export function getMpGrowthRange(job, level = 99) {
+  if (isBeginnerLevel(level)) {
+    return BEGINNER_MP_GROWTH_RANGE;
+  }
   if (job === 'magician') {
     return [22, 24];
   }
@@ -340,11 +413,15 @@ export function getMinHp(job, level) {
 
 /**
  * 计算等级 MP 底线
+ * 一转前：新手 10×等级−5；一转后按职业对照表
  * @param {JobId} job
  * @param {number} level
  * @returns {number}
  */
 export function getMinMp(job, level) {
+  if (isBeginnerLevel(level)) {
+    return getBeginnerMinMp(level);
+  }
   // 二转后 Min MP（对照表）
   if (job === 'magician') {
     return 22 * level + 449;
@@ -361,6 +438,45 @@ export function getMinMp(job, level) {
   }
   // 船长 / 拳手
   return 18 * level + 95;
+}
+
+/**
+ * 升级洗血基础 HP 区间（一转前新手固定 +8）
+ * @param {JobId} job
+ * @param {number} level
+ * @returns {[number, number]}
+ */
+export function getFreshHpWashRange(job, level) {
+  if (isBeginnerLevel(level)) {
+    return [BEGINNER_FRESH_HP_WASH, BEGINNER_FRESH_HP_WASH];
+  }
+  return FRESH_HP_WASH_RANGE[job];
+}
+
+/**
+ * 洗血/退点扣蓝（一转前新手固定 -8）
+ * @param {JobId} job
+ * @param {number} level
+ * @returns {number}
+ */
+export function getAprMpDeduction(job, level) {
+  if (isBeginnerLevel(level)) {
+    return BEGINNER_APR_MP_DEDUCTION;
+  }
+  return APR_MP_DEDUCTION[job];
+}
+
+/**
+ * 重置洗血 HP 收益（一转前与新手洗血一致 +8）
+ * @param {JobId} job
+ * @param {number} level
+ * @returns {number}
+ */
+export function getStaleHpWashGain(job, level) {
+  if (isBeginnerLevel(level)) {
+    return BEGINNER_FRESH_HP_WASH;
+  }
+  return STALE_HP_WASH_GAIN[job];
 }
 
 /** @typedef {0 | 10 | 20 | 30} MwLevel */
@@ -452,9 +568,10 @@ export function getLevelUpIntMpBonus(panelInt, equipInt, characterLevel, mwLevel
 }
 
 /**
- * 物理职业一次完整扩蓝的净 MP（已含退点扣蓝）
+ * 物理职业一次完整扩蓝的净 MP（已含退点扣蓝后的最终增量）
  * 对照：额外 MP = floor(基础 INT / 10) - 2
- * @param {number} panelInt
+ * 其中 −2 为净收益公式常数；展示用「加蓝量」= 净蓝 + 职业 APR 退点扣蓝（如海盗 16）
+ * @param {number} panelInt 基础 INT（不含 MW、不含装备）
  * @returns {number}
  */
 export function getPhysicalMpWashNet(panelInt) {
@@ -487,14 +604,14 @@ export function getMpWashIntBonus(job, panelInt) {
  * @param {number} [_mwStartLevel]
  * @returns {number}
  */
-export function getMpWashGain(job, panelInt, _characterLevel, _mwLevel, _mwStartLevel) {
+export function getMpWashGain(job, panelInt, characterLevel = 99, _mwLevel, _mwStartLevel) {
   if (job === 'magician') {
     return (
       randomInt(MAGICIAN_MP_WASH_BASE_MIN, MAGICIAN_MP_WASH_BASE_MAX) +
       getMpWashIntBonus(job, panelInt)
     );
   }
-  return getPhysicalMpWashNet(panelInt) + APR_MP_DEDUCTION[job];
+  return getPhysicalMpWashNet(panelInt) + getAprMpDeduction(job, characterLevel);
 }
 
 /**
